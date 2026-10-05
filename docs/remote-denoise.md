@@ -1,13 +1,16 @@
 # AI Denoise on another machine's GPU
 
-AI Denoise (`enhance.denoise`, Photo ▸ Enhance ▸ Denoise…) runs a small learned network over the
-demosaiced raw data in tiles. The tiles can run on **another computer's GPU**: a desktop with a
-big graphics card serves them to a laptop over your LAN or VPN. The laptop keeps the files, writes
-the result, and falls back to its own GPU, then its CPU, if the server can't be reached.
+AI Denoise (`enhance.denoise`, Photo ▸ Enhance…) runs a small learned network over the
+demosaiced raw data in tiles. The tiles can also run on **another computer's GPU**: a desktop with
+a big graphics card serves them to a laptop over your LAN or VPN. The laptop keeps the files and
+writes the result. Its own GPU and the server **work at the same time**, pulling tiles from one
+queue, so a server behind a slow link still adds speed instead of costing it; a server that can't
+be reached (or drops out mid-job) hands its tiles back, and the CPU only finishes what the GPUs
+leave.
 
 ```text
-laptop (LightCraft)  ── tiles (f16, ~0.7 MB each) ──▶  desktop (lightcraft-cli denoise-serve)
-                     ◀── denoised residuals ─────────    GPU: wgpu (Vulkan / DX12 / Metal)
+laptop (LightCraft)  ── tiles (f16, compressed) ──▶  desktop (lightcraft-cli denoise-serve)
+   its own GPU too   ◀── denoised residuals ───────    GPU: wgpu (Vulkan / DX12 / Metal)
 ```
 
 The server runs the **same** network code as the app (`crates/denoise` + the WGSL kernels in
@@ -53,16 +56,17 @@ stored in the library's `prefs.json` in plain text).
 
 ## Protocol (version 1)
 
-One JSON line per message (`\n`-terminated, ≤ 4 KiB), optionally followed by little-endian f16
-samples whose shape the line gives. A connection serves any number of requests; the client keeps
-a few open to hide latency.
+One JSON line per message (`\n`-terminated, ≤ 4 KiB), optionally followed by a payload of
+`bytes` bytes: the tile's samples as little-endian f16, byte-shuffled (all low bytes, then all
+high bytes) and deflated. A payload that inflates past its tile is refused. A connection serves any
+number of requests; the client keeps four open to hide latency.
 
 ```text
 → {"v":1,"token":"…","op":"hello"}
 ← {"ok":true,"v":1,"backend":"GPU: …","model":{"name":"…","hash":"…"}}
-→ {"v":1,"token":"…","op":"run","model":"<hash>","c":4,"h":H,"w":W}  + c·h·w f16
-← {"ok":true,"c":3,"h":H,"w":W}                                      + c·h·w f16
-← {"ok":false,"error":"…"}                                           (any failure)
+→ {"v":1,"token":"…","op":"run","model":"<hash>","c":4,"h":H,"w":W,"bytes":N}  + N bytes
+← {"ok":true,"c":3,"h":H,"w":W,"bytes":N}                                      + N bytes
+← {"ok":false,"error":"…"}                                                     (any failure)
 ```
 
 ## Speed
@@ -75,5 +79,16 @@ per pixel), measured with `cargo test -p lightcraft-gpu --release --lib denoise_
 | CPU, Apple M3 | 376 ms | ~2 min 18 s |
 | GPU, Apple M3 (Metal) | 70 ms | ~26 s |
 
-Remote throughput also depends on the link: a 24 MP raw sends about 0.3 GB of tiles and gets
-about 0.2 GB back (f16), so a fast LAN or a nearby VPN peer matters as much as the GPU.
+A whole raw (Nikon D6, 20.8 MP, 330 tiles), Apple M3 laptop and an RTX 3060 Ti server reached
+over Tailscale through a **relay** (DERP: no direct path between the two networks):
+
+| Where the tiles ran | time |
+|---|---:|
+| laptop GPU only | 24.2 s |
+| server only, uncompressed tiles | 166 s |
+| server only, compressed tiles | 88 s |
+| laptop GPU + server together | 20.4 s (server: 77 of 330 tiles) |
+
+Over a relay the link, not the server's GPU, sets the pace; on a LAN or a direct Tailscale path
+(`tailscale ping <server>` says "via <ip>" rather than "via DERP") the server takes most of the
+tiles. Either way, running both is never slower than the laptop alone.
