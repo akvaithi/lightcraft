@@ -407,7 +407,7 @@ under the UI command that wraps it (a no-op error); the UI command now wins.
 | LR-HDR-SDRPREVIEW | SDR preview of HDR | P2 | 🟡 | `ctl:hdr.sdr*` | SDR rendition sliders (brightness, contrast, highlights, shadows, whites, clarity) used by every SDR view and export; no separate SDR-preview toggle until HDR display lands |
 | LR-HDR-VISUALIZE | Visualize HDR range | P2 | ✅ | `cmd:view.visualizeHdr`, `crates/pipeline/src/visualize.rs` (`hdr_range`) | grey below SDR white, four colour bands by stops above it |
 | LR-HDR-LIMIT | HDR headroom limit | P2 | ✅ | `ctl:hdr.maxEv`, `cmd:develop.hdr` | 0 to 5 stops |
-| LR-HDR-EXPORT | HDR export | P2 | 🟡 | `cmd:app.export`, `crates/codecs/src/gainmap.rs`, `crates/engine/src/export.rs` (`encode_gain_map_jpeg`) | `hdr` export option: ISO 21496-1 gain map JPEG (plus Adobe hdrgm and Apple XMP), 32-bit float TIFF; AVIF PQ/HLG not yet; no HEIC (no permissive HEVC encoder) |
+| LR-HDR-EXPORT | HDR export | P2 | 🟡 | `cmd:app.export`, `crates/codecs/src/gainmap.rs`, `crates/engine/src/export.rs` (`encode_gain_map_jpeg`) | `hdr` export option: ISO 21496-1 gain map JPEG (plus Adobe hdrgm and Apple XMP), 10-bit Rec. 2020 PQ AVIF, 32-bit float TIFF; no HLG yet; no HEIC (no permissive HEVC encoder) |
 
 ## R. Video (VID)
 
@@ -431,7 +431,7 @@ under the UI command that wraps it (a no-op error); the UI command now wins.
 | LR-EXP-BITDEPTH | Bit depth | P1 | ✅ | `cmd:app.export` (`bitDepth`), `crates/pipeline/src/output.rs` (`OutputDepth`), `crates/engine/src/export.rs` | 16-bit PNG/TIFF rendered at 16 bits (TIFF defaults to 16), 32-bit float linear TIFF with a linear profile, 10-bit AVIF; high-bit-depth renders run on the CPU |
 | LR-EXP-COMPRESSION | TIFF compression | P1 | ✅ | `cmd:app.export` (`tiffCompression`: none / lzw / zip) | |
 | LR-EXP-COLORSPACE | Output colour space | P0 | ✅ | `cmd:app.export` (`colorSpace`), `crates/pipeline/src/output.rs`, `crates/engine/src/export.rs` | sRGB, Display P3, Adobe RGB (1998) compatible, ProPhoto RGB, Rec. 2020: rendered from the working space with gamut mapping into the target gamut (CPU + GPU), own ICC profile embedded; AVIF stays sRGB (muxer has no ICC) |
-| LR-EXP-HDR | HDR output | P2 | 🟡 | `cmd:app.export`, `crates/ui-egui/src/panels/dialogs.rs` | HDR output checkbox in the export dialog: gain map JPEG, float TIFF; AVIF later |
+| LR-EXP-HDR | HDR output | P2 | 🟡 | `cmd:app.export`, `crates/ui-egui/src/panels/dialogs.rs` | HDR output checkbox in the export dialog: gain map JPEG, PQ AVIF, float TIFF; no HDR presets yet |
 | LR-EXP-SHARPEN | Output sharpening | P1 | ✅ | `cmd:app.export` (`sharpen`, `sharpenAmount`) | |
 | LR-EXP-METADATA | Metadata policy | P1 | ✅ | `cmd:app.export` (`metadata`, `removeLocation`) | |
 | LR-EXP-WATERMARK | Watermark | P1 | ✅ | `cmd:app.export` (`watermark`: text or `image` + `imageWidth`), `crates/engine/src/export.rs` (`Watermark`) | text (size, colour, shadow) or a graphic with transparency (width as % of the photo, converted to the output colour space); position, inset, opacity |

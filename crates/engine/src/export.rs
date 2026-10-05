@@ -461,8 +461,9 @@ pub struct ExportOptions {
     /// format's default (TIFF 16, everything else 8). See [`ExportOptions::effective_depth`].
     pub bit_depth: Option<u8>,
     /// HDR output for photos edited in HDR: JPEG as an ISO 21496-1 gain map JPEG (the SDR
-    /// rendition plus a gain map, so the file looks right everywhere), 32-bit float TIFF with the
-    /// highlights above SDR white kept. Other formats, and photos without an HDR edit, are SDR.
+    /// rendition plus a gain map, so the file looks right everywhere; quality as set, `limit_kb`
+    /// not applied), AVIF as 10-bit Rec. 2020 PQ, 32-bit float TIFF with the highlights above SDR
+    /// white kept. Other formats, and photos without an HDR edit, are SDR.
     pub hdr: bool,
 }
 
@@ -607,6 +608,7 @@ impl ExportOptions {
             (ExportFormat::Tiff, Some(32)) if self.hdr => OutputDepth::F32Hdr,
             (ExportFormat::Tiff, Some(32)) => OutputDepth::F32Linear,
             (ExportFormat::Tiff, _) => OutputDepth::U16,
+            (ExportFormat::Avif, _) if self.hdr => OutputDepth::F32Hdr,
             (ExportFormat::Avif, Some(10 | 16 | 32)) => OutputDepth::U16,
             (ExportFormat::Avif, _) => OutputDepth::U8,
         }
@@ -622,15 +624,19 @@ impl ExportOptions {
         }
     }
 
-    /// Whether these options write HDR files (for photos edited in HDR): JPEG (gain map) or
-    /// 32-bit float TIFF with [`ExportOptions::hdr`].
+    /// Whether these options write HDR files (for photos edited in HDR): JPEG (gain map), AVIF
+    /// (PQ) or 32-bit float TIFF with [`ExportOptions::hdr`].
     pub fn hdr_output(&self) -> bool {
-        self.hdr && matches!((self.format, self.bit_depth), (ExportFormat::Jpeg, _) | (ExportFormat::Tiff, Some(32)))
+        self.hdr && matches!((self.format, self.bit_depth), (ExportFormat::Jpeg | ExportFormat::Avif, _) | (ExportFormat::Tiff, Some(32)))
     }
 
-    /// The colour space the file is actually written in (AVIF: sRGB).
+    /// The colour space the file is actually written in (AVIF: sRGB, or Rec. 2020 for HDR).
     pub fn effective_space(&self) -> OutputSpace {
-        if self.format == ExportFormat::Avif { OutputSpace::Srgb } else { self.color_space }
+        match self.format {
+            ExportFormat::Avif if self.hdr => OutputSpace::Rec2020,
+            ExportFormat::Avif => OutputSpace::Srgb,
+            _ => self.color_space,
+        }
     }
 
     /// Output file name for photo `p` at 1-based position `seq` in a batch (the original's
@@ -883,11 +889,14 @@ pub fn encode_deep(img: &DeepImage, o: &ExportOptions, meta: Option<&Metadata>) 
         DeepSamples::U16(v) => EncodeImage::new(w, h, 3, Samples::U16(v)),
         DeepSamples::F32(v) => EncodeImage::new(w, h, 3, Samples::F32(v)),
     };
-    let r = match o.format {
-        ExportFormat::Png => encode::encode_png(&e, &meta),
-        ExportFormat::Tiff => encode::encode_tiff(&e, o.tiff_compression, &meta),
-        ExportFormat::Avif => encode::encode_avif(&e, o.quality, 8, &meta),
-        f => return Err(format!("{f:?} export is 8-bit only")),
+    let r = match (o.format, &img.samples) {
+        (ExportFormat::Png, _) => encode::encode_png(&e, &meta),
+        (ExportFormat::Tiff, _) => encode::encode_tiff(&e, o.tiff_compression, &meta),
+        (ExportFormat::Avif, DeepSamples::F32(v)) if img.space == OutputSpace::Rec2020 => {
+            lightcraft_codecs::encode_avif_pq(w, h, v, o.quality, 8, &meta)
+        }
+        (ExportFormat::Avif, _) => encode::encode_avif(&e, o.quality, 8, &meta),
+        (f, _) => return Err(format!("{f:?} export is 8-bit only")),
     };
     r.map_err(|e| e.to_string())
 }
@@ -1016,10 +1025,18 @@ pub fn prepare_export(
 ) -> Result<PreparedExport, String> {
     let p = session.catalog.photo(id).ok_or("no such photo")?;
     let file_name = o.file_name_for(p, seq);
+    // HDR output only for photos edited in HDR; the rest of the batch exports as usual
+    let sdr_opts;
+    let o = if o.hdr && !p.develop.hdr.enabled {
+        sdr_opts = ExportOptions { hdr: false, ..o.clone() };
+        &sdr_opts
+    } else {
+        o
+    };
     let work = if o.format.is_rendered() {
         let (w, h) = output_size(p, o);
         let meta = export_metadata(p, o);
-        let gain_map = o.hdr_output() && o.format == ExportFormat::Jpeg && p.develop.hdr.enabled;
+        let gain_map = o.hdr_output() && o.format == ExportFormat::Jpeg;
         let job = session.export_job(id, w, h, o.effective_space(), o.effective_depth())?;
         let hdr_job = if gain_map { Some(session.export_job(id, w, h, o.effective_space(), OutputDepth::F32Hdr)?) } else { None };
         Work::Render(Box::new(RenderWork { job, hdr_job, meta, opts: o.clone() }))

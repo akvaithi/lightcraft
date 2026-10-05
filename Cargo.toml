@@ -60,6 +60,9 @@ image-webp = "0.2"
 moxcms = { version = "0.9", default-features = false, features = ["lut"] }
 jxl-oxide = { version = "0.12", default-features = false }
 ravif = { version = "0.13", default-features = false, features = ["threading"] } # no "asm": it needs nasm (non-Rust)
+# HDR AVIF (PQ): ravif fixes the sRGB transfer curve, so HDR files drive its rav1e + avif-serialize directly
+rav1e = { version = "0.8.1", default-features = false, features = ["threading"] }
+avif-serialize = "0.8.6"
 
 # gpu (crates/gpu; native backends only, no GL: everything stays pure Rust)
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "metal", "vulkan", "dx12", "wgsl"] }

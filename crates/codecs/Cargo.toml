@@ -29,13 +29,15 @@ jxl-oxide = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ravif = { workspace = true, optional = true }
+rav1e = { workspace = true, optional = true }
+avif-serialize = { workspace = true, optional = true }
 
 [features]
 default = ["parallel", "jxl", "avif"]
 parallel = ["dep:rayon", "lightcraft-raster/parallel", "jpeg-decoder/rayon"]
 jxl = ["dep:jxl-oxide"]
 ## AVIF encoding via ravif/rav1e (pure Rust, BSD). Native targets only; a no-op on wasm32.
-avif = ["dep:ravif"]
+avif = ["dep:ravif", "dep:rav1e", "dep:avif-serialize"]
 
 [dev-dependencies]
 proptest = { workspace = true }

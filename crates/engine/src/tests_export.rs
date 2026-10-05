@@ -259,3 +259,21 @@ fn hdr_float_tiff_keeps_highlights_above_white() {
     assert!(sdr <= 1.0 + 1e-3, "SDR float TIFF stays in 0..1 ({sdr})");
     assert!(hdr > 1.2 && hdr <= 4.0 + 1e-3, "HDR float TIFF max {hdr}");
 }
+
+#[test]
+fn hdr_avif_export_is_pq_rec2020() {
+    let mut s = Session::with_demo();
+    let id = sunset(&mut s);
+    let o = ExportOptions::from_json(&json!({"longEdge": 160, "format": "avif", "hdr": true, "quality": 70}));
+    assert!(o.hdr_output());
+    let sdr = export_photo(&mut s, id, &o, 1).unwrap();
+    s.execute("develop.hdr", &json!({"enabled": true, "maxEv": 2})).unwrap();
+    let hdr = export_photo(&mut s, id, &o, 1).unwrap();
+    // the `colr` nclx box: BT.2020 primaries (9), PQ (16), BT.2020 NCL (9), full range
+    let nclx = |b: &[u8]| b.windows(4).position(|w| w == b"nclx").map(|i| b[i + 4..i + 11].to_vec());
+    let c = nclx(&hdr.bytes).expect("colr nclx box");
+    assert_eq!(c, vec![0, 9, 0, 16, 0, 9, 0x80]);
+    assert!(hdr.bytes.windows(4).any(|w| w == b"clli"), "content light level box");
+    // a photo without an HDR edit exports as an ordinary (sRGB) AVIF
+    assert!(nclx(&sdr.bytes).is_none_or(|c| c[3] != 16));
+}

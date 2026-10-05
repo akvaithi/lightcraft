@@ -363,6 +363,141 @@ pub fn encode_avif(img: &EncodeImage, quality: u8, speed: u8, meta: &EncodeMeta)
     }
 }
 
+/// Absolute luminance of SDR white in an HDR file (ITU-R BT.2408 reference white), cd/m².
+pub const HDR_REFERENCE_WHITE_NITS: f32 = 203.0;
+
+/// SMPTE ST 2084 (PQ) inverse EOTF: luminance in cd/m² → signal 0..1.
+pub fn pq_encode(nits: f32) -> f32 {
+    const M1: f32 = 2610.0 / 16384.0;
+    const M2: f32 = 2523.0 / 4096.0 * 128.0;
+    const C1: f32 = 3424.0 / 4096.0;
+    const C2: f32 = 2413.0 / 4096.0 * 32.0;
+    const C3: f32 = 2392.0 / 4096.0 * 32.0;
+    let y = (nits / 10_000.0).clamp(0.0, 1.0).powf(M1);
+    ((C1 + C2 * y) / (1.0 + C3 * y)).powf(M2)
+}
+
+/// SMPTE ST 2084 (PQ) EOTF: signal 0..1 → luminance in cd/m².
+pub fn pq_decode(e: f32) -> f32 {
+    const M1: f32 = 2610.0 / 16384.0;
+    const M2: f32 = 2523.0 / 4096.0 * 128.0;
+    const C1: f32 = 3424.0 / 4096.0;
+    const C2: f32 = 2413.0 / 4096.0 * 32.0;
+    const C3: f32 = 2392.0 / 4096.0 * 32.0;
+    let p = e.clamp(0.0, 1.0).powf(1.0 / M2);
+    ((p - C1).max(0.0) / (C2 - C3 * p)).powf(1.0 / M1) * 10_000.0
+}
+
+/// Encode an HDR AVIF: `rgb` is linear light in **Rec. 2020** primaries with SDR white at 1.0
+/// (`width × height × 3`). Written as 10-bit 4:4:4 BT.2020 non-constant-luminance YCbCr with the
+/// PQ transfer curve, SDR white at [`HDR_REFERENCE_WHITE_NITS`], and a content light level box.
+/// `quality` 1..=100, `speed` 1..=10. Native targets with the `avif` feature only.
+pub fn encode_avif_pq(width: u32, height: u32, rgb: &[f32], quality: u8, speed: u8, meta: &EncodeMeta) -> Result<Vec<u8>> {
+    let (w, h) = (width as usize, height as usize);
+    let n = w.checked_mul(h).ok_or_else(|| Error::Encode("image too large".into()))?;
+    if n == 0 || rgb.len() < n * 3 {
+        return Err(Error::Encode("HDR AVIF: sample buffer too short".into()));
+    }
+    #[cfg(all(feature = "avif", not(target_arch = "wasm32")))]
+    {
+        use rav1e::prelude::*;
+        const K: [f32; 3] = [0.2627, 0.6780, 0.0593]; // BT.2020 NCL
+        let mut max_nits = 0f32;
+        let mut sum_nits = 0f64;
+        let planes: Vec<[u16; 3]> = rgb
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .take(n)
+            .map(|c| {
+                let nits = c.map(|v| (if v.is_finite() { v.max(0.0) } else { 0.0 }) * HDR_REFERENCE_WHITE_NITS);
+                let y_nits = K[0] * nits[0] + K[1] * nits[1] + K[2] * nits[2];
+                max_nits = max_nits.max(nits[0].max(nits[1]).max(nits[2]));
+                sum_nits += y_nits as f64;
+                let [r, g, b] = nits.map(pq_encode);
+                let y = K[0] * r + K[1] * g + K[2] * b;
+                let cb = (b - y) / (2.0 * (1.0 - K[2])) + 0.5;
+                let cr = (r - y) / (2.0 * (1.0 - K[0])) + 0.5;
+                [y, cb, cr].map(|v| (v * 1023.0).round().clamp(0.0, 1023.0) as u16)
+            })
+            .collect();
+        let q = quality.clamp(1, 100) as f32 / 100.0;
+        // ravif's quality → quantizer curve, so qualities match the SDR AVIF path
+        let x = if q >= 0.82 {
+            (1.0 - q) * 2.6
+        } else if q > 0.25 {
+            1.0 - 0.125 - q * 0.5
+        } else {
+            1.0 - q
+        };
+        let quantizer = (x * 255.0).round() as usize;
+        let mut ec = EncoderConfig::with_speed_preset(speed.clamp(1, 10));
+        ec.width = w;
+        ec.height = h;
+        ec.time_base = Rational::new(1, 1);
+        ec.bit_depth = 10;
+        ec.chroma_sampling = ChromaSampling::Cs444;
+        ec.pixel_range = PixelRange::Full;
+        ec.color_description = Some(ColorDescription {
+            color_primaries: ColorPrimaries::BT2020,
+            transfer_characteristics: TransferCharacteristics::SMPTE2084,
+            matrix_coefficients: MatrixCoefficients::BT2020NCL,
+        });
+        let cll = (max_nits.ceil().clamp(1.0, 10_000.0) as u16, ((sum_nits / n as f64).ceil().clamp(1.0, 10_000.0)) as u16);
+        ec.content_light = Some(ContentLight { max_content_light_level: cll.0, max_frame_average_light_level: cll.1 });
+        ec.still_picture = true;
+        ec.quantizer = quantizer;
+        ec.min_quantizer = quantizer.min(255) as u8;
+        ec.speed_settings.multiref = false;
+        ec.speed_settings.rdo_lookahead_frames = 1;
+        ec.speed_settings.scene_detection_mode = SceneDetectionSpeed::None;
+        let e = |e: &dyn std::fmt::Display| Error::Encode(format!("AV1: {e}"));
+        let mut ctx: Context<u16> = Config::new().with_encoder_config(ec).new_context().map_err(|x| e(&x))?;
+        let mut frame = ctx.new_frame();
+        {
+            let mut it = planes.iter();
+            let mut fp = frame.planes.iter_mut();
+            let (Some(py), Some(pu), Some(pv)) = (fp.next(), fp.next(), fp.next()) else {
+                return Err(Error::Encode("AV1: frame has no planes".into()));
+            };
+            let (mut sy, mut su, mut sv) = (py.mut_slice(Default::default()), pu.mut_slice(Default::default()), pv.mut_slice(Default::default()));
+            for ((ry, ru), rv) in sy.rows_iter_mut().zip(su.rows_iter_mut()).zip(sv.rows_iter_mut()).take(h) {
+                for ((y, u), v) in ry.iter_mut().zip(ru.iter_mut()).zip(rv.iter_mut()).take(w) {
+                    let Some(p) = it.next() else { break };
+                    (*y, *u, *v) = (p[0], p[1], p[2]);
+                }
+            }
+        }
+        ctx.send_frame(frame).map_err(|x| e(&x))?;
+        ctx.flush();
+        let mut av1 = Vec::new();
+        loop {
+            match ctx.receive_packet() {
+                Ok(mut p) if p.frame_type == FrameType::KEY => av1.append(&mut p.data),
+                Ok(_) => {}
+                Err(EncoderStatus::Encoded | EncoderStatus::LimitReached) => break,
+                Err(x) => return Err(e(&x)),
+            }
+        }
+        use avif_serialize::constants as c;
+        let mut a = avif_serialize::Aviffy::new();
+        a.set_matrix_coefficients(c::MatrixCoefficients::Bt2020Ncl)
+            .set_transfer_characteristics(c::TransferCharacteristics::Smpte2084)
+            .set_color_primaries(c::ColorPrimaries::Bt2020)
+            .set_full_color_range(true)
+            .set_content_light_level(cll.0, cll.1);
+        if let Some(exif) = meta.exif {
+            a.set_exif(exif.to_vec());
+        }
+        Ok(a.to_vec(&av1, None, width, height, 10))
+    }
+    #[cfg(not(all(feature = "avif", not(target_arch = "wasm32"))))]
+    {
+        let _ = (quality, speed, meta);
+        Err(Error::Encode("AVIF encoding is not available in this build".into()))
+    }
+}
+
 /// 16-bit RGB(A) → 10-bit BT.601 full-range YCbCr planes (the matrix `ravif` uses for 8-bit input).
 #[cfg(all(feature = "avif", not(target_arch = "wasm32")))]
 fn avif_10bit(enc: &ravif::Encoder, img: &EncodeImage, s: &[u16]) -> Result<Vec<u8>> {
