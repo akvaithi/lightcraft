@@ -1,0 +1,17 @@
+[package]
+name = "lightcraft-denoise"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LightCraft AI Denoise: model format, CPU inference, tiling and the noise model; GPU and remote backends plug in (L2)"
+
+[lints]
+workspace = true
+
+[dependencies]
+lightcraft-raster = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+half = { workspace = true }

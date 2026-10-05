@@ -2155,6 +2155,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lightcraft-denoise"
+version = "0.2.0"
+dependencies = [
+ "half",
+ "lightcraft-raster",
+ "rayon",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "lightcraft-develop"
 version = "0.2.0"
 dependencies = [

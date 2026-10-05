@@ -26,6 +26,7 @@ lightcraft-gpu = { path = "crates/gpu" }
 lightcraft-catalog = { path = "crates/catalog" }
 lightcraft-preview = { path = "crates/preview" }
 lightcraft-merge = { path = "crates/merge" }
+lightcraft-denoise = { path = "crates/denoise" }
 lightcraft-engine = { path = "crates/engine" }
 lightcraft-ui-egui = { path = "crates/ui-egui" }
 lightcraft-mcp = { path = "crates/mcp" }
@@ -38,6 +39,7 @@ log = "0.4"
 rayon = "1"
 proptest = "1"
 bytemuck = { version = "1", features = ["derive"] }
+half = { version = "2", default-features = false, features = ["std"] } # f16 model weights and tiles (lightcraft-denoise)
 crc32fast = "1"
 siphasher = "1"
 libc = "0.2" # dev-only: process CPU time in benches
