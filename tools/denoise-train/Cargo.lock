@@ -3130,6 +3130,7 @@ dependencies = [
  "burn",
  "lightcraft-color",
  "lightcraft-denoise",
+ "lightcraft-meta",
  "lightcraft-raster",
  "lightcraft-raw",
  "lightcraft-scenes",

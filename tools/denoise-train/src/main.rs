@@ -159,23 +159,51 @@ impl Rng {
 /// Where clean images come from.
 enum Clean {
     Scenes(Vec<lightcraft_scenes::Scene>),
-    /// Decoded, demosaicked, 2×-downscaled low-ISO raws (linear camera RGB, white = 1).
-    Raws(Vec<Rgb32f>),
+    /// Crops of decoded, demosaicked, 2×-downscaled low-ISO raws (linear camera RGB, white = 1,
+    /// stored as 16-bit to keep a large corpus in memory).
+    Raws(Vec<Crop16>),
 }
 
-fn load_raws(dir: &Path) -> Vec<Rgb32f> {
+struct Crop16 {
+    w: usize,
+    h: usize,
+    data: Vec<[u16; 3]>,
+}
+
+const RAW_CROPS: usize = 16;
+const RAW_CROP: usize = 512;
+const MAX_ISO: u32 = 800;
+
+fn load_raws(dir: &Path) -> Vec<Crop16> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir).map(|d| d.filter_map(|e| e.ok().map(|e| e.path())).collect()).unwrap_or_default();
     files.sort();
-    files
+    let per_file: Vec<Vec<Crop16>> = files
         .par_iter()
-        .filter_map(|p| {
-            let bytes = std::fs::read(p).ok()?;
-            lightcraft_raw::probe(&bytes)?;
-            let raw = lightcraft_raw::decode(&bytes).ok()?;
-            let img = raw.develop(lightcraft_raw::Method::Ahd).ok()?;
-            // 2× box downscale: the raw's own noise drops by half, detail stays sharp
+        .enumerate()
+        .map(|(k, p)| {
+            let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let Ok(bytes) = std::fs::read(p) else { return vec![] };
+            if lightcraft_raw::probe(&bytes).is_none() {
+                return vec![];
+            }
+            if let Some(iso) = lightcraft_meta::extract(&bytes).iso.filter(|i| *i > MAX_ISO) {
+                eprintln!("  skip {name}: ISO {iso}");
+                return vec![];
+            }
+            let img = match lightcraft_raw::decode(&bytes).and_then(|r| r.develop(lightcraft_raw::Method::Ahd)) {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("  skip {name}: {e}");
+                    return vec![];
+                }
+            };
+            drop(bytes);
+            // 2× box downscale: the raw's own noise halves, detail stays sharp
             let (w, h) = (img.width / 2, img.height / 2);
-            let small = Rgb32f::from_fn(w, h, |x, y| {
+            if w < RAW_CROP || h < RAW_CROP {
+                return vec![];
+            }
+            let at = |x: usize, y: usize| {
                 let mut s = [0f32; 3];
                 for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
                     let p = img.data[(2 * y + dy) * img.width + 2 * x + dx];
@@ -183,12 +211,22 @@ fn load_raws(dir: &Path) -> Vec<Rgb32f> {
                         s[c] += p[c] * 0.25;
                     }
                 }
-                s
-            });
-            eprintln!("  {} → {}×{}", p.display(), w, h);
-            Some(small)
+                s.map(|v| (v.clamp(0.0, 1.0) * 65535.0).round() as u16)
+            };
+            let mut rng = Rng::new(0xC0FFEE + k as u64);
+            let crops: Vec<Crop16> = (0..RAW_CROPS)
+                .map(|_| {
+                    let x0 = (rng.next() % (w - RAW_CROP + 1) as u64) as usize;
+                    let y0 = (rng.next() % (h - RAW_CROP + 1) as u64) as usize;
+                    let data = (0..RAW_CROP * RAW_CROP).map(|i| at(x0 + i % RAW_CROP, y0 + i / RAW_CROP)).collect();
+                    Crop16 { w: RAW_CROP, h: RAW_CROP, data }
+                })
+                .collect();
+            eprintln!("  {name}: {}×{} → {} crops", w, h, crops.len());
+            crops
         })
-        .collect()
+        .collect();
+    per_file.into_iter().flatten().collect()
 }
 
 /// A clean `size × size` linear image (white = 1, values clipped at the sensor's white).
@@ -201,7 +239,11 @@ fn clean_image(src: &Clean, rng: &mut Rng, size: usize) -> Rgb32f {
             let full = sc.render(big, big * 2 / 3 + 1);
             crop(&full, rng, size)
         }
-        Clean::Raws(r) => crop(&r[(rng.next() % r.len() as u64) as usize], rng, size),
+        Clean::Raws(r) => {
+            let c = &r[(rng.next() % r.len() as u64) as usize];
+            let img = Rgb32f::from_fn(c.w, c.h, |x, y| c.data[y * c.w + x].map(|v| v as f32 / 65535.0));
+            crop(&img, rng, size)
+        }
     };
     let gain = 2f32.powf(rng.range(-3.0, 1.0));
     Rgb32f { data: img.data.iter().map(|p| p.map(|v| (v * gain).clamp(0.0, 1.0))).collect(), ..img }
