@@ -2162,6 +2162,7 @@ version = "0.2.0"
 dependencies = [
  "half",
  "lightcraft-raster",
+ "miniz_oxide 0.8.9",
  "rayon",
  "serde",
  "serde_json",

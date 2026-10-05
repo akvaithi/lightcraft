@@ -20,6 +20,10 @@ pub mod remote;
 
 pub use model::{Model, Op, Tensor};
 
+use std::collections::VecDeque;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use lightcraft_raster::Rgb32f;
 
 #[derive(Debug, thiserror::Error)]
@@ -145,31 +149,14 @@ impl NoiseModel {
     }
 }
 
-/// The level and noise [`prepare`] takes the noise channel from: green's 3×3 mean (green is the
-/// densest and least noisy channel of a Bayer sensor).
-fn local_level(img: &Rgb32f, x: usize, y: usize) -> f32 {
-    let (w, h) = (img.width, img.height);
-    let mut s = 0.0;
-    let mut n = 0.0;
-    for yy in y.saturating_sub(1)..(y + 2).min(h) {
-        for xx in x.saturating_sub(1)..(x + 2).min(w) {
-            s += img.data.get(yy * w + xx).map_or(0.0, |p| p[1]);
-            n += 1.0;
-        }
-    }
-    if n > 0.0 { s / n } else { 0.0 }
-}
-
 const GAMMA: f32 = 2.2;
 
 /// The network input for the `w × h` region of `img` at (`x0`, `y0`) under [`model::Preprocess::Gamma22Sigma`]:
-/// `x^(1/2.2)` per channel, then the noise standard deviation in that domain. The region may
-/// extend past the image: the edge pixels repeat there.
+/// `x^(1/2.2)` per channel, then the noise standard deviation in that domain
+/// ([`sigma_plane`]). The region may extend past the image: the edge pixels repeat there.
 pub fn prepare(img: &Rgb32f, noise: &NoiseModel, x0: isize, y0: isize, w: usize, h: usize) -> Tensor {
     let mut t = Tensor::zeros(4, h, w);
     let n = w * h;
-    let a = (noise.a[0] + noise.a[1] + noise.a[2]) / 3.0;
-    let b = (noise.b[0] + noise.b[1] + noise.b[2]) / 3.0;
     for y in 0..h {
         for x in 0..w {
             let sx = (x0 + x as isize).clamp(0, img.width.saturating_sub(1) as isize) as usize;
@@ -181,16 +168,44 @@ pub fn prepare(img: &Rgb32f, noise: &NoiseModel, x0: isize, y0: isize, w: usize,
                     *v = p[c].max(0.0).powf(1.0 / GAMMA);
                 }
             }
-            let m = local_level(img, sx, sy).max(1e-4);
+        }
+    }
+    let sigma = sigma_plane(t.data.get(..3 * n).unwrap_or(&[]), w, h, noise);
+    if let Some(dst) = t.data.get_mut(3 * n..4 * n) {
+        dst.copy_from_slice(&sigma);
+    }
+    t
+}
+
+/// The noise channel of [`prepare`] from a tile's three gamma planes (`3 × h × w`): the noise
+/// standard deviation, in the gamma domain, at the level of green's 3×3 mean (green is the
+/// densest and least noisy channel of a Bayer sensor). A remote server rebuilds the channel with
+/// this instead of receiving it.
+pub fn sigma_plane(y: &[f32], w: usize, h: usize, noise: &NoiseModel) -> Vec<f32> {
+    let n = w * h;
+    let a = (noise.a[0] + noise.a[1] + noise.a[2]) / 3.0;
+    let b = (noise.b[0] + noise.b[1] + noise.b[2]) / 3.0;
+    let green = |x: usize, yy: usize| y.get(n + yy * w + x).map_or(0.0, |v| v.max(0.0).powf(GAMMA));
+    let mut out = vec![0f32; n];
+    for yy in 0..h {
+        for x in 0..w {
+            let mut s = 0.0;
+            let mut k = 0.0;
+            for y2 in yy.saturating_sub(1)..(yy + 2).min(h) {
+                for x2 in x.saturating_sub(1)..(x + 2).min(w) {
+                    s += green(x2, y2);
+                    k += 1.0;
+                }
+            }
+            let m = (if k > 0.0 { s / k } else { 0.0 }).max(1e-4);
             let sd = (a * m + b).max(0.0).sqrt();
             // d(x^(1/γ))/dx = x^(1/γ − 1) / γ
-            let s = (sd * m.powf(1.0 / GAMMA - 1.0) / GAMMA).clamp(0.0, 1.0);
-            if let Some(v) = t.data.get_mut(3 * n + i) {
-                *v = s;
+            if let Some(o) = out.get_mut(yy * w + x) {
+                *o = (sd * m.powf(1.0 / GAMMA - 1.0) / GAMMA).clamp(0.0, 1.0);
             }
         }
     }
-    t
+    out
 }
 
 /// The denoised linear value from the prepared input `y` (gamma domain) and the network's residual.
@@ -209,6 +224,11 @@ pub trait Backend: Sync {
     fn concurrency(&self) -> usize {
         1
     }
+    /// Only for what the other backends leave (the CPU: slow, and it competes with tile
+    /// preparation). Other backends share the work at the same time.
+    fn last_resort(&self) -> bool {
+        false
+    }
 }
 
 /// [`model::run_cpu`] as a backend.
@@ -221,6 +241,9 @@ impl Backend for Cpu {
     fn run(&self, model: &Model, x: &Tensor) -> Result<Tensor> {
         model::run_cpu(model, x)
     }
+    fn last_resort(&self) -> bool {
+        true
+    }
 }
 
 /// How [`denoise`] went.
@@ -229,8 +252,10 @@ impl Backend for Cpu {
 pub struct Report {
     /// Number of tiles.
     pub tiles: usize,
-    /// The backends that ran tiles, in order of use.
+    /// The backends that ran tiles.
     pub backends: Vec<String>,
+    /// How many tiles each of them ran.
+    pub tiles_by_backend: Vec<(String, usize)>,
     /// Why earlier backends were given up ("remote …: connection refused").
     pub fallbacks: Vec<String>,
     pub noise: Option<NoiseModel>,
@@ -250,8 +275,10 @@ impl Default for Tiling {
 }
 
 /// Denoise `img` (linear camera RGB, white = 1) with `model`, blending `amount` (0..1) of the
-/// result over the input. `backends` are tried in order; a failing backend is dropped for the
-/// rest of the image. `progress(fraction)` returns false to cancel.
+/// result over the input. The `backends` share the tiles: every one that isn't a last resort
+/// pulls tiles from a common queue at the same time (a remote GPU and this machine's GPU add up);
+/// one that fails hands its tile back and drops out, and last-resort backends (the CPU) finish
+/// whatever is left. `progress(fraction)` returns false to cancel.
 pub fn denoise(
     img: &Rgb32f,
     noise: &NoiseModel,
@@ -285,123 +312,150 @@ pub fn denoise(
         }
         y += core;
     }
-    let mut acc = vec![[0f32; 3]; w * h];
-    let mut wsum = vec![0f32; w * h];
-    let mut report = Report { tiles: cores.len(), noise: Some(*noise), ..Default::default() };
-    let mut current = 0usize;
+    let n_tiles = cores.len();
     let amount = amount.clamp(0.0, 1.0);
-    let mut done = 0usize;
-    let mut next = 0usize;
-    while next < cores.len() {
-        let Some(backend) = backends.get(current) else {
-            return Err(Error::Backend { backend: "all".into(), reason: report.fallbacks.join("; ") });
-        };
-        let batch: Vec<usize> = (next..(next + backend.concurrency().clamp(1, 64)).min(cores.len())).collect();
-        // the extended region of each tile: `ov` beyond its core on every side (past the image
-        // edge too, so the network never meets a hard border inside the picture), padded up to
-        // the model's multiple
-        let regions: Vec<(isize, isize, usize, usize)> = batch
-            .iter()
-            .filter_map(|&i| cores.get(i))
-            .map(|&(cx, cy, cw, ch)| {
-                (cx as isize - ov as isize, cy as isize - ov as isize, (cw + 2 * ov).next_multiple_of(m), (ch + 2 * ov).next_multiple_of(m))
-            })
-            .collect();
-        let run_tile = |&(x0, y0, pw, ph): &(isize, isize, usize, usize)| -> Result<Tensor> {
-            let t = prepare(img, noise, x0, y0, pw, ph);
-            let r = backend.run(model, &t)?;
-            if (r.c, r.h, r.w) != (3, ph, pw) || r.data.iter().any(|v| !v.is_finite()) {
-                return Err(Error::Backend {
-                    backend: backend.name(), reason: format!("returned a {}×{}×{} tile for 3×{ph}×{pw}", r.c, r.h, r.w)
-                });
-            }
-            Ok(Tensor { c: 7, h: ph, w: pw, data: [t.data, r.data].concat() })
-        };
-        let results: Vec<Result<Tensor>> = if regions.len() == 1 {
-            regions.iter().map(run_tile).collect()
-        } else {
-            // one thread per tile in flight; where threads can't be spawned, run in place
-            std::thread::scope(|s| {
-                let handles: Vec<_> = regions
-                    .iter()
-                    .map(|r| (r, std::thread::Builder::new().name("denoise-tile".into()).spawn_scoped(s, move || run_tile(r))))
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|(r, h)| match h {
-                        Ok(h) => h.join().unwrap_or_else(|_| Err(Error::Backend { backend: backend.name(), reason: "tile thread panicked".into() })),
-                        Err(_) => run_tile(r),
-                    })
-                    .collect()
-            })
-        };
-        if let Some(Err(e)) = results.iter().find(|r| r.is_err()) {
-            report.fallbacks.push(format!("{}: {e}", backend.name()));
-            current += 1;
-            continue; // the same batch again on the next backend
+    // the extended region of each tile: `ov` beyond its core on every side (past the image edge
+    // too, so the network never meets a hard border inside the picture), padded up to the model's
+    // multiple
+    let region = |i: usize| -> Option<(isize, isize, usize, usize)> {
+        cores.get(i).map(|&(cx, cy, cw, ch)| {
+            (cx as isize - ov as isize, cy as isize - ov as isize, (cw + 2 * ov).next_multiple_of(m), (ch + 2 * ov).next_multiple_of(m))
+        })
+    };
+    struct Shared {
+        acc: Vec<[f32; 3]>,
+        wsum: Vec<f32>,
+        done: usize,
+        per_backend: Vec<usize>,
+    }
+    let shared = Mutex::new(Shared { acc: vec![[0f32; 3]; w * h], wsum: vec![0f32; w * h], done: 0, per_backend: vec![0; backends.len()] });
+    let queue: Mutex<VecDeque<usize>> = Mutex::new((0..n_tiles).collect());
+    let dead: Vec<AtomicBool> = backends.iter().map(|_| AtomicBool::new(false)).collect();
+    let fallbacks: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let cancelled = AtomicBool::new(false);
+
+    let run_tile = |b: &dyn Backend, (x0, y0, pw, ph): (isize, isize, usize, usize)| -> Result<Tensor> {
+        let t = prepare(img, noise, x0, y0, pw, ph);
+        let r = b.run(model, &t)?;
+        if (r.c, r.h, r.w) != (3, ph, pw) || r.data.iter().any(|v| !v.is_finite()) {
+            return Err(Error::Backend { backend: b.name(), reason: format!("returned a {}×{}×{} tile for 3×{ph}×{pw}", r.c, r.h, r.w) });
         }
-        for (&(x0, y0, pw, ph), r) in regions.iter().zip(results) {
-            let Ok(t) = r else { continue };
-            let n = pw * ph;
-            // the tile's core spans [ov, ov + core) of the region; weights ramp up over the
-            // overlap and back down after the core, so neighbouring tiles cross-fade
-            let core_w = pw.saturating_sub(2 * ov).max(1);
-            let core_h = ph.saturating_sub(2 * ov).max(1);
-            for ty in 0..ph {
-                let iy = y0 + ty as isize;
-                if iy < 0 || iy >= h as isize {
+        Ok(Tensor { c: 7, h: ph, w: pw, data: [t.data, r.data].concat() })
+    };
+    // blend one finished tile into the accumulators: the outer half of each overlap is never
+    // used (the network's zero padding shows there); the inner half cross-fades with the neighbour
+    let blend = |s: &mut Shared, (x0, y0, pw, ph): (isize, isize, usize, usize), t: &Tensor| {
+        let n = pw * ph;
+        let core_w = pw.saturating_sub(2 * ov).max(1);
+        let core_h = ph.saturating_sub(2 * ov).max(1);
+        let ramp = |d: usize, core: usize| {
+            let margin = (ov / 2) as f32;
+            let len = (ov as f32 - margin).max(1.0);
+            let up = (d as f32 + 0.5 - margin) / len;
+            let down = (ov as f32 * 2.0 + core as f32 - d as f32 - 0.5 - margin) / len;
+            up.min(down).clamp(0.0, 1.0)
+        };
+        for ty in 0..ph {
+            let iy = y0 + ty as isize;
+            if iy < 0 || iy >= h as isize {
+                continue;
+            }
+            for tx in 0..pw {
+                let ix = x0 + tx as isize;
+                if ix < 0 || ix >= w as isize {
                     continue;
                 }
-                for tx in 0..pw {
-                    let ix = x0 + tx as isize;
-                    if ix < 0 || ix >= w as isize {
-                        continue;
-                    }
-                    let (ix, iy) = (ix as usize, iy as usize);
-                    // the outer half of each overlap is never used (the network's zero padding
-                    // shows there); the inner half cross-fades with the neighbour
-                    let ramp = |d: usize, core: usize| {
-                        let margin = (ov / 2) as f32;
-                        let len = (ov as f32 - margin).max(1.0);
-                        let up = (d as f32 + 0.5 - margin) / len;
-                        let down = (ov as f32 * 2.0 + core as f32 - d as f32 - 0.5 - margin) / len;
-                        up.min(down).clamp(0.0, 1.0)
-                    };
-                    let wt = ramp(tx, core_w) * ramp(ty, core_h);
-                    if wt <= 0.0 {
-                        continue;
-                    }
-                    let i = ty * pw + tx;
-                    let Some(a) = acc.get_mut(iy * w + ix) else { continue };
+                let wt = ramp(tx, core_w) * ramp(ty, core_h);
+                if wt <= 0.0 {
+                    continue;
+                }
+                let (k, i) = (iy as usize * w + ix as usize, ty * pw + tx);
+                if let Some(a) = s.acc.get_mut(k) {
                     for c in 0..3 {
                         let yv = t.data.get(c * n + i).copied().unwrap_or(0.0);
                         let res = t.data.get((4 + c) * n + i).copied().unwrap_or(0.0);
                         a[c] += finish(yv, res) * wt;
                     }
-                    if let Some(s) = wsum.get_mut(iy * w + ix) {
-                        *s += wt;
-                    }
+                }
+                if let Some(ws) = s.wsum.get_mut(k) {
+                    *ws += wt;
                 }
             }
         }
-        let name = backend.name();
-        report.backends.extend(std::iter::repeat_n(name, batch.len()));
-        done += batch.len();
-        next += batch.len();
-        if !progress(done as f32 / cores.len() as f32) {
-            return Err(Error::Cancelled);
+    };
+    // a worker: pull tiles until the queue is empty, its backend fails or the job is cancelled
+    let worker = |bi: usize, b: &dyn Backend| loop {
+        if cancelled.load(Ordering::Relaxed) || dead.get(bi).is_some_and(|d| d.load(Ordering::Relaxed)) {
+            break;
         }
+        let Some(i) = queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop_front() else { break };
+        let Some(r) = region(i) else { continue };
+        match run_tile(b, r) {
+            Ok(t) => {
+                let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                blend(&mut s, r, &t);
+                s.done += 1;
+                if let Some(c) = s.per_backend.get_mut(bi) {
+                    *c += 1;
+                }
+                let f = s.done as f32 / n_tiles as f32;
+                drop(s);
+                if !progress(f) {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+            }
+            Err(e) => {
+                // hand the tile back for the others, and stop using this backend
+                queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push_front(i);
+                if dead.get(bi).is_some_and(|d| !d.swap(true, Ordering::Relaxed)) {
+                    fallbacks.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(format!("{}: {e}", b.name()));
+                }
+                break;
+            }
+        }
+    };
+    // every backend in `set` works on the queue at once (each with its own concurrency)
+    let run_wave = |set: &[usize]| {
+        std::thread::scope(|sc| {
+            for &bi in set {
+                let Some(b) = backends.get(bi).copied() else { continue };
+                for _ in 0..b.concurrency().clamp(1, 16) {
+                    if std::thread::Builder::new().name("denoise-tile".into()).spawn_scoped(sc, move || worker(bi, b)).is_err() {
+                        worker(bi, b); // no threads here (e.g. the browser): run in place
+                    }
+                }
+            }
+        });
+    };
+    // the accelerators share the work; last-resort backends (the CPU) only pick up what they leave
+    let (first, rest): (Vec<usize>, Vec<usize>) = (0..backends.len()).partition(|&i| backends.get(i).is_some_and(|b| !b.last_resort()));
+    let first = if first.is_empty() { rest.clone() } else { first };
+    run_wave(&first);
+    if !cancelled.load(Ordering::Relaxed) && !queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty() {
+        let left: Vec<usize> = rest.into_iter().filter(|i| !first.contains(i) && dead.get(*i).is_some_and(|d| !d.load(Ordering::Relaxed))).collect();
+        run_wave(&left);
+    }
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(Error::Cancelled);
+    }
+    let fallbacks = fallbacks.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let s = shared.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if s.done < n_tiles {
+        let reason = if fallbacks.is_empty() { "tiles left undone".to_string() } else { fallbacks.join("; ") };
+        return Err(Error::Backend { backend: "all".into(), reason });
     }
     let mut out = img.clone();
-    for ((o, a), s) in out.data.iter_mut().zip(&acc).zip(&wsum) {
-        if *s > 0.0 {
+    for ((o, a), ws) in out.data.iter_mut().zip(&s.acc).zip(&s.wsum) {
+        if *ws > 0.0 {
             for c in 0..3 {
-                let d = a[c] / s;
+                let d = a[c] / ws;
                 o[c] += (d - o[c]) * amount;
             }
         }
     }
-    report.backends.dedup();
+    let used: Vec<(String, usize)> = backends.iter().zip(&s.per_backend).filter(|(_, n)| **n > 0).map(|(b, n)| (b.name(), *n)).collect();
+    let report =
+        Report { tiles: n_tiles, backends: used.iter().map(|u| u.0.clone()).collect(), tiles_by_backend: used, fallbacks, noise: Some(*noise) };
     Ok((out, report))
 }
 
@@ -458,6 +512,56 @@ mod tests {
         let e = denoise(&img, &nm, &zero_model(), &[&Broken], 1.0, Tiling::default(), &|_| true).unwrap_err();
         assert!(e.to_string().contains("connection refused"));
         assert!(matches!(denoise(&img, &nm, &zero_model(), &[&Cpu], 1.0, Tiling { core: 16, overlap: 4 }, &|_| false), Err(Error::Cancelled)));
+    }
+
+    /// A CPU-backed accelerator for tests: slow enough that tiles interleave, failing after
+    /// `fail_after` tiles when set.
+    struct Accel {
+        name: &'static str,
+        fail_after: Option<usize>,
+        ran: std::sync::atomic::AtomicUsize,
+    }
+    impl Backend for Accel {
+        fn name(&self) -> String {
+            self.name.into()
+        }
+        fn run(&self, m: &Model, x: &Tensor) -> Result<Tensor> {
+            let n = self.ran.fetch_add(1, Ordering::SeqCst);
+            if self.fail_after.is_some_and(|f| n >= f) {
+                return Err(Error::Backend { backend: self.name.into(), reason: "link dropped".into() });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            model::run_cpu(m, x)
+        }
+    }
+
+    #[test]
+    fn accelerators_share_tiles_and_a_failing_one_hands_its_work_back() {
+        let img = ramp(96, 80);
+        let nm = NoiseModel { a: [1e-4; 3], b: [1e-6; 3] };
+        let t = Tiling { core: 16, overlap: 4 };
+        let a = Accel { name: "gpu", fail_after: None, ran: Default::default() };
+        let b = Accel { name: "remote", fail_after: None, ran: Default::default() };
+        let (both, rep) = denoise(&img, &nm, &zero_model(), &[&b, &a, &Cpu], 1.0, t, &|_| true).unwrap();
+        assert_eq!(rep.tiles, 30);
+        let counts: std::collections::HashMap<_, _> = rep.tiles_by_backend.iter().cloned().collect();
+        assert!(counts.get("gpu").is_some_and(|n| *n > 0) && counts.get("remote").is_some_and(|n| *n > 0), "{counts:?}");
+        assert!(!counts.contains_key("CPU"), "the CPU only picks up leftovers");
+        let (one, _) = denoise(&img, &nm, &zero_model(), &[&Cpu], 1.0, t, &|_| true).unwrap();
+        // tiles blend in arrival order, so only float rounding may differ
+        let close = |a: &Rgb32f, b: &Rgb32f| a.data.iter().zip(&b.data).all(|(p, q)| (0..3).all(|c| (p[c] - q[c]).abs() < 1e-5));
+        assert!(close(&both, &one), "sharing doesn't change the result");
+        // the remote link dies after 3 tiles: the GPU finishes, the reason is reported
+        let a = Accel { name: "gpu", fail_after: None, ran: Default::default() };
+        let b = Accel { name: "remote", fail_after: Some(3), ran: Default::default() };
+        let (out, rep) = denoise(&img, &nm, &zero_model(), &[&b, &a, &Cpu], 1.0, t, &|_| true).unwrap();
+        assert!(close(&out, &one));
+        assert!(rep.fallbacks.iter().any(|f| f.contains("link dropped")), "{:?}", rep.fallbacks);
+        assert_eq!(rep.tiles_by_backend.iter().map(|t| t.1).sum::<usize>(), 30);
+        // every accelerator fails: the CPU takes over
+        let a = Accel { name: "gpu", fail_after: Some(0), ran: Default::default() };
+        let (_, rep) = denoise(&img, &nm, &zero_model(), &[&a, &Cpu], 1.0, t, &|_| true).unwrap();
+        assert_eq!(rep.backends, vec!["CPU".to_string()]);
     }
 
     #[test]

@@ -2,14 +2,16 @@
 //! Tailscale/WireGuard: the connection itself is not encrypted).
 //!
 //! Protocol (version 1). Each message is one JSON line (`\n`-terminated, ≤ 4 KiB), optionally
-//! followed by a binary payload of little-endian f16 samples whose shape the line gives:
+//! followed by a binary payload of `bytes` bytes: the tile's c·h·w samples as little-endian f16,
+//! byte-shuffled (every sample's low byte, then every high byte) and deflated. Shuffling puts the
+//! slowly varying high bytes together, which roughly halves what crosses a slow link.
 //!
 //! ```text
 //! → {"v":1,"token":"…","op":"hello"}
 //! ← {"ok":true,"v":1,"backend":"GPU: …","model":{"name":"…","hash":"…"}}
-//! → {"v":1,"token":"…","op":"run","model":"<hash>","c":4,"h":H,"w":W}  + c·h·w f16
-//! ← {"ok":true,"c":3,"h":H,"w":W}                                      + c·h·w f16
-//! ← {"ok":false,"error":"…"}                                           (any failure)
+//! → {"v":1,"token":"…","op":"run","model":"<hash>","c":4,"h":H,"w":W,"bytes":N}  + N bytes
+//! ← {"ok":true,"c":3,"h":H,"w":W,"bytes":N}                                      + N bytes
+//! ← {"ok":false,"error":"…"}                                                     (any failure)
 //! ```
 //!
 //! A connection serves any number of requests. The server refuses a wrong token, another model
@@ -48,18 +50,49 @@ fn read_line(r: &mut impl BufRead) -> std::io::Result<Option<String>> {
     String::from_utf8(buf).map(Some).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "header is not UTF-8"))
 }
 
-fn write_f16(w: &mut impl Write, data: &[f32]) -> std::io::Result<()> {
-    let mut b = Vec::with_capacity(data.len() * 2);
-    for v in data {
-        b.extend_from_slice(&half::f16::from_f32(*v).to_le_bytes());
+/// Samples → f16 → byte-shuffled → deflated (see the protocol above).
+pub fn pack(data: &[f32]) -> Vec<u8> {
+    let n = data.len();
+    let mut b = vec![0u8; n * 2];
+    let (lo, hi) = b.split_at_mut(n);
+    for ((v, l), h) in data.iter().zip(lo.iter_mut()).zip(hi.iter_mut()) {
+        [*l, *h] = half::f16::from_f32(*v).to_le_bytes();
     }
-    w.write_all(&b)
+    miniz_oxide::deflate::compress_to_vec(&b, 1)
 }
 
-fn read_f16(r: &mut impl Read, n: usize) -> std::io::Result<Vec<f32>> {
-    let mut b = vec![0u8; n * 2];
+/// The inverse of [`pack`] for exactly `n` samples (refuses anything that inflates to more).
+pub fn unpack(bytes: &[u8], n: usize) -> std::io::Result<Vec<f32>> {
+    let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
+    let b = miniz_oxide::inflate::decompress_to_vec_with_limit(bytes, n * 2).map_err(|_| bad("payload doesn't inflate to the tile size"))?;
+    if b.len() != n * 2 {
+        return Err(bad("payload size doesn't match the tile"));
+    }
+    let (lo, hi) = b.split_at(n);
+    Ok(lo.iter().zip(hi).map(|(l, h)| half::f16::from_le_bytes([*l, *h]).to_f32()).collect())
+}
+
+fn write_payload(w: &mut impl Write, header: Value, data: &[f32]) -> std::io::Result<()> {
+    let packed = pack(data);
+    let mut header = header;
+    header["bytes"] = json!(packed.len());
+    writeln!(w, "{header}")?;
+    w.write_all(&packed)
+}
+
+/// Read a payload of `bytes` bytes holding `n` samples (`bytes` is capped: a hostile header can't
+/// make us allocate more than an uncompressed tile, plus slack).
+fn read_payload(r: &mut impl Read, bytes: usize, n: usize) -> std::io::Result<Vec<f32>> {
+    if bytes > n * 2 + 4096 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "payload larger than its tile"));
+    }
+    let mut b = vec![0u8; bytes];
     r.read_exact(&mut b)?;
-    Ok(b.as_chunks::<2>().0.iter().map(|c| half::f16::from_le_bytes(*c).to_f32()).collect())
+    unpack(&b, n)
+}
+
+fn payload_bytes(v: &Value) -> Option<usize> {
+    v.get("bytes").and_then(Value::as_u64).map(|b| b as usize)
 }
 
 fn shape(v: &Value) -> Option<(usize, usize, usize)> {
@@ -161,20 +194,25 @@ fn handle(stream: TcpStream, model: &Model, backend: &dyn Backend, opts: &Server
                 writeln!(w, "{}", json!({"ok": true, "v": PROTOCOL, "backend": backend.name(), "model": {"name": model.header.name, "hash": hash}}))?;
             }
             Some("run") => {
-                let Some((c, h, wd)) = shape(&req) else {
+                let (Some((c, h, wd)), Some(bytes)) = (shape(&req), payload_bytes(&req)) else {
                     fail(&mut w, "bad or oversized tile shape")?;
                     break;
                 };
                 // the payload is read before any refusal, so the stream stays in step
-                let data = read_f16(&mut r, c * h * wd)?;
+                let data = match read_payload(&mut r, bytes, c * h * wd) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        fail(&mut w, &e.to_string())?;
+                        break;
+                    }
+                };
                 if req.get("model").and_then(Value::as_str) != Some(hash.as_str()) {
                     fail(&mut w, &format!("model mismatch: this server runs {} ({hash})", model.header.name))?;
                     continue;
                 }
                 match backend.run(model, &Tensor { c, h, w: wd, data }) {
                     Ok(out) => {
-                        writeln!(w, "{}", json!({"ok": true, "c": out.c, "h": out.h, "w": out.w}))?;
-                        write_f16(&mut w, &out.data)?;
+                        write_payload(&mut w, json!({"ok": true, "c": out.c, "h": out.h, "w": out.w}), &out.data)?;
                         tiles += 1;
                     }
                     Err(e) => fail(&mut w, &e.to_string())?,
@@ -307,12 +345,12 @@ impl Backend for Remote {
         }
         let (mut r, mut s) = self.take()?;
         let req = json!({"v": PROTOCOL, "token": self.token, "op": "run", "model": hash_hex(model.hash), "c": x.c, "h": x.h, "w": x.w});
-        writeln!(s, "{req}").map_err(|e| self.err(e))?;
-        write_f16(&mut s, &x.data).map_err(|e| self.err(e))?;
+        write_payload(&mut s, req, &x.data).map_err(|e| self.err(e))?;
         s.flush().map_err(|e| self.err(e))?;
         let v = self.reply(&mut r)?;
         let (c, h, w) = shape(&v).ok_or_else(|| self.err("bad tile shape in reply"))?;
-        let data = read_f16(&mut r, c * h * w).map_err(|e| self.err(e))?;
+        let bytes = payload_bytes(&v).ok_or_else(|| self.err("reply without a payload size"))?;
+        let data = read_payload(&mut r, bytes, c * h * w).map_err(|e| self.err(e))?;
         self.put((r, s));
         Ok(Tensor { c, h, w, data })
     }
@@ -408,5 +446,20 @@ mod tests {
         // the server still works
         assert!(Remote::new(&addr, TOKEN).hello().is_ok());
         assert!(same("abc", "abc") && !same("abc", "abd") && !same("abc", "abcd"));
+        // a payload that inflates past its tile is refused
+        let bomb = miniz_oxide::deflate::compress_to_vec(&vec![0u8; 1 << 20], 9);
+        let hdr = format!("{}\n", json!({"v": 1, "token": TOKEN, "op": "run", "model": "x", "c": 1, "h": 8, "w": 8, "bytes": bomb.len()}));
+        assert!(talk(&[hdr.as_bytes(), &bomb].concat()).contains("false"));
+        assert!(Remote::new(&addr, TOKEN).hello().is_ok());
+    }
+
+    #[test]
+    fn packing_round_trips_and_shrinks_smooth_data() {
+        let noisy: Vec<f32> = (0..4096).map(|i| 0.5 + ((i * 7919 % 101) as f32 - 50.0) * 0.002).collect();
+        let back = unpack(&pack(&noisy), noisy.len()).unwrap();
+        assert!(noisy.iter().zip(&back).all(|(a, b)| (a - b).abs() < 1e-3));
+        let smooth: Vec<f32> = (0..4096).map(|i| 0.01 + i as f32 * 1e-6).collect();
+        assert!(pack(&smooth).len() < smooth.len() * 2 / 4, "smooth planes compress well");
+        assert!(unpack(&pack(&noisy), noisy.len() + 1).is_err());
     }
 }
