@@ -79,6 +79,46 @@ pub enum ChromaSubsampling {
 
 const XMP_NS: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
 
+/// The APP segments [`encode_jpeg`] writes for `meta` (marker byte, payload): JFIF density, EXIF,
+/// XMP and the ICC profile in chunks, in that order.
+pub(crate) fn jpeg_app_segments(meta: &EncodeMeta) -> Result<Vec<(u8, Vec<u8>)>> {
+    let mut segs: Vec<(u8, Vec<u8>)> = Vec::new();
+    let ppi = meta.ppi.filter(|p| *p > 0).map_or([0u8, 0, 1, 0, 1], |p| {
+        let [hi, lo] = p.to_be_bytes();
+        [1, hi, lo, hi, lo]
+    });
+    segs.push((0xE0, [&b"JFIF\0\x01\x02"[..], &ppi, &[0, 0]].concat()));
+    if let Some(exif) = meta.exif {
+        if exif.len() > 65_527 {
+            return Err(Error::Encode("EXIF larger than one APP1 segment (64 KiB)".into()));
+        }
+        segs.push((0xE1, [&b"Exif\0\0"[..], exif].concat()));
+    }
+    if let Some(xmp) = meta.xmp {
+        segs.push((0xE1, xmp_segment(xmp)?));
+    }
+    if let Some(icc) = meta.icc {
+        // ICC.1 Annex B.4: "ICC_PROFILE\0", 1-based chunk number, chunk count
+        let chunks: Vec<&[u8]> = icc.chunks(65_519).collect();
+        if chunks.len() > 255 {
+            return Err(Error::Encode("ICC profile too large for JPEG".into()));
+        }
+        for (i, c) in chunks.iter().enumerate() {
+            segs.push((0xE2, [&b"ICC_PROFILE\0"[..], &[i as u8 + 1, chunks.len() as u8], c].concat()));
+        }
+    }
+    Ok(segs)
+}
+
+/// An APP1 XMP payload (namespace + packet), refusing packets larger than one segment.
+pub(crate) fn xmp_segment(xmp: &str) -> Result<Vec<u8>> {
+    let seg = [XMP_NS, xmp.as_bytes()].concat();
+    if seg.len() > 65_533 {
+        return Err(Error::Encode("XMP larger than one APP1 segment (extended XMP not supported)".into()));
+    }
+    Ok(seg)
+}
+
 /// Encode baseline JPEG (8-bit; alpha is dropped). `quality` 1..=100.
 pub fn encode_jpeg(img: &EncodeImage, quality: u8, subsampling: ChromaSubsampling, meta: &EncodeMeta) -> Result<Vec<u8>> {
     img.validate()?;
@@ -97,35 +137,7 @@ pub fn encode_jpeg(img: &EncodeImage, quality: u8, subsampling: ChromaSubsamplin
     };
     if subsampling != ChromaSubsampling::S422 {
         // Parallel encoder (restart-interval bands on all cores).
-        let mut segs: Vec<(u8, Vec<u8>)> = Vec::new();
-        let ppi = meta.ppi.filter(|p| *p > 0).map_or([0u8, 0, 1, 0, 1], |p| {
-            let [hi, lo] = p.to_be_bytes();
-            [1, hi, lo, hi, lo]
-        });
-        segs.push((0xE0, [&b"JFIF\0\x01\x02"[..], &ppi, &[0, 0]].concat()));
-        if let Some(exif) = meta.exif {
-            if exif.len() > 65_527 {
-                return Err(Error::Encode("EXIF larger than one APP1 segment (64 KiB)".into()));
-            }
-            segs.push((0xE1, [&b"Exif\0\0"[..], exif].concat()));
-        }
-        if let Some(xmp) = meta.xmp {
-            let seg = [XMP_NS, xmp.as_bytes()].concat();
-            if seg.len() > 65_533 {
-                return Err(Error::Encode("XMP larger than one APP1 segment (extended XMP not supported)".into()));
-            }
-            segs.push((0xE1, seg));
-        }
-        if let Some(icc) = meta.icc {
-            // ICC.1 Annex B.4: "ICC_PROFILE\0", 1-based chunk number, chunk count
-            let chunks: Vec<&[u8]> = icc.chunks(65_519).collect();
-            if chunks.len() > 255 {
-                return Err(Error::Encode("ICC profile too large for JPEG".into()));
-            }
-            for (i, c) in chunks.iter().enumerate() {
-                segs.push((0xE2, [&b"ICC_PROFILE\0"[..], &[i as u8 + 1, chunks.len() as u8], c].concat()));
-            }
-        }
+        let segs = jpeg_app_segments(meta)?;
         let ch = if img.channels == 2 { 1 } else { img.channels as usize };
         // `data` is already gray for 2-channel input (see above)
         return Ok(crate::jpeg_par::encode(&data, img.width as usize, img.height as usize, ch, quality, subsampling, &segs));

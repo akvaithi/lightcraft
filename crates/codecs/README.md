@@ -22,6 +22,12 @@ encode_png(&EncodeImage::new(w, h, 4, Samples::U16(&px)), &meta)?;
 encode_tiff(&EncodeImage::new(w, h, 3, Samples::F32(&px)), TiffCompression::Deflate, &meta)?;
 encode_webp_lossless(&img, &meta)?;
 encode_avif(&img, 70, 6, &meta)?;                        // native + feature `avif`
+
+// HDR gain map JPEG (ISO 21496-1): SDR + HDR renditions → base + gain map, and back
+let (map, gm) = gainmap::compute(&sdr_linear, &hdr_linear, w, h, luma, &GainMapOptions::default())?;
+gainmap::encode_jpeg(&EncodeImage::new(w, h, 3, Samples::U8(&base8)), &map, &gm, 90, ChromaSubsampling::S444, &meta)?;
+let found = gainmap::read_jpeg(&bytes);                  // ours, cameras', Lightroom's
+gainmap::apply(&mut base_linear, w, h, &found.gain, &found.meta, 1.0)?;
 ```
 
 `Format::RawTiffLike` (DNG, CR2, NEF, ARW, PEF, ORF, RW2, SRW, …) and `Format::RawOther` (CR3, RAF,
@@ -41,6 +47,7 @@ CRW, MRW, X3F) are detected so the engine can route them to `lightcraft-raw`; `d
 | JPEG XL | yes (jxl-oxide, feature `jxl`, default on) | — | enum colour → rendered straight to linear Rec.2020; ICC → our ICC path; orientation applied by the decoder (reported as 1) |
 | AVIF | **no** | yes (ravif/rav1e, native only, feature `avif`) | 8-bit sRGB, EXIF; no ICC in the muxer |
 | HEIC/HEIF | **no** (sniff only) | — | see gaps |
+| Gain map JPEG (HDR) | gain map found and decoded (`gainmap::read_jpeg`): ISO 21496-1 metadata, else Adobe `hdrgm` XMP | yes (`gainmap::encode_jpeg`) | CIPA DC-007 MPF index (gain map typed `0x050000`), ISO 21496-1 APP2 on both images, `hdrgm` + Container XMP for Android/Chrome, Apple `HDRGainMap`/`HDRToneMap` XMP; gain maps are never used as thumbnails |
 
 ## Colour
 

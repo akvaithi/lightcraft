@@ -17,6 +17,7 @@
 mod convert;
 pub mod encode;
 pub mod exif;
+pub mod gainmap;
 pub mod icc;
 mod jpeg;
 pub mod jpeg_par;
