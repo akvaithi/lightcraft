@@ -45,6 +45,7 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
         Dialog::PasteSettings { .. } => "Paste Selected Settings",
         Dialog::Export { .. } => "Export",
         Dialog::Merge { opts } => opts.title(),
+        Dialog::Enhance { .. } => "Enhance",
         Dialog::Settings { .. } => "Settings",
         Dialog::ConfirmDelete { .. } => "Delete Photos",
         Dialog::About => "About LightCraft",
@@ -652,6 +653,7 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                     });
                 }
                 Dialog::Merge { opts } => crate::merge::body(app, ui, opts),
+                Dialog::Enhance { amount, stack } => crate::enhance::body(app, ui, amount, stack),
                 Dialog::Import { opts } => crate::import::body(app, ui, opts),
                 Dialog::Settings { tab } => crate::panels::settings::body(app, ui, tab),
                 Dialog::ConfirmDelete { count } => {
@@ -734,6 +736,7 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                         add_label.as_str()
                     }
                     Dialog::Merge { .. } => "Merge",
+                    Dialog::Enhance { .. } => "Denoise",
                     Dialog::ConfirmDelete { .. } => "Delete",
                     _ if informational => "Close",
                     _ => "OK",
@@ -848,6 +851,7 @@ pub fn confirm_dialog(app: &mut LightcraftApp, dlg: &Dialog) -> Result<serde_jso
             app.run("app.export", p)
         }
         Dialog::Merge { opts } => crate::merge::start_final(app, opts),
+        Dialog::Enhance { amount, stack } => crate::enhance::start(app, *amount, *stack),
         Dialog::Import { opts } => crate::import::start(app, opts),
         Dialog::ConfirmDelete { .. } => app.run("photo.delete", json!({})),
         Dialog::About | Dialog::Shortcuts | Dialog::Settings { .. } => Ok(serde_json::Value::Null),

@@ -64,6 +64,7 @@ pub fn load_model(path: &str) -> Result<Arc<Model>> {
 }
 
 /// A planned denoise of one or more photos (runs without the session, e.g. on a worker thread).
+#[derive(Clone)]
 pub struct DenoiseJob {
     pub sources: Vec<(PhotoId, String)>,
     /// 0..1.

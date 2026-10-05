@@ -249,7 +249,7 @@ under the UI command that wraps it (a no-op error); the UI command now wins.
 | LR-EDIT-DETAIL-SHARPEN | Sharpening | P0 | ✅ | `ctl:detail.sharpenAmount`, `ctl:detail.sharpenRadius`, `ctl:detail.sharpenDetail`, `ctl:detail.sharpenMasking` | no Alt-drag mask preview |
 | LR-EDIT-DETAIL-NR | Luminance noise reduction | P0 | ✅ | `ctl:detail.nrLuminance`, `ctl:detail.nrDetail`, `ctl:detail.nrContrast` | |
 | LR-EDIT-DETAIL-CNR | Colour noise reduction | P0 | ✅ | `ctl:detail.nrColor`, `ctl:detail.nrColorDetail`, `ctl:detail.nrColorSmoothness` | |
-| LR-EDIT-DETAIL-DENOISE | AI denoise | P2 | 🟡 | `cmd:enhance.denoise`, `cmd:denoise.status`, `cmd:denoise.preferences`, `crates/denoise/src/lib.rs`, `crates/gpu/src/denoise.rs`, `docs/remote-denoise.md` | learned denoiser on demosaiced raw data → Enhanced-NR DNG stacked on the original; CPU, GPU (WGSL) and remote-GPU backends with fallback; no trained weights ship yet (the model is a separate .lcdn file); no Enhance dialog yet (command only) |
+| LR-EDIT-DETAIL-DENOISE | AI denoise | P2 | 🟡 | `cmd:dialog.enhance`, `cmd:enhance.denoise`, `cmd:denoise.status`, `cmd:denoise.preferences`, `crates/denoise/src/lib.rs`, `crates/gpu/src/denoise.rs`, `docs/remote-denoise.md` | learned denoiser on demosaiced raw data → Enhanced-NR DNG stacked on the original; CPU, GPU (WGSL) and remote-GPU backends with fallback; no trained weights ship yet (the model is a separate .lcdn file) |
 | LR-EDIT-DETAIL-RAWDETAILS | Improved demosaic toggle | P2 | ⬜ | | |
 | LR-EDIT-DETAIL-SUPERRES | Super resolution | P2 | ⬜ | | |
 | LR-EDIT-DETAIL-AISHARPEN | AI sharpen | OOS | 🚫 | | |

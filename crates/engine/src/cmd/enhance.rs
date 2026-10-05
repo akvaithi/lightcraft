@@ -55,9 +55,9 @@ pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!(
             "enhance.denoise",
-            "Denoise…",
-            ["Photo", "Enhance"],
-            Some("Cmd+Alt+I"),
+            "Denoise",
+            [],
+            None,
             "{ids?, amount=50 (0..100), stack=true} — AI Denoise of raw photos: writes <name>-Enhanced-NR.dng next to each, imports it with the original's edits (manual noise reduction off) and stacks it on the original. Runs on the remote GPU server when configured, else this machine → {photos: [{id, source, path, width, height, report: {tiles, backends, fallbacks, noise}}]}",
             can_denoise,
             |s, p| {

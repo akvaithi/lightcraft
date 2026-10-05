@@ -495,6 +495,11 @@ pub enum Dialog {
     Merge {
         opts: crate::merge::MergeDialog,
     },
+    /// Photo ▸ Enhance (AI Denoise): amount 0..100 and whether to stack with the original.
+    Enhance {
+        amount: f64,
+        stack: bool,
+    },
     /// Settings (preferences): `tab` = general | import | performance | interface.
     Settings {
         tab: String,

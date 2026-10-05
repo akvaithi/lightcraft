@@ -7,6 +7,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod control;
+pub mod enhance;
 pub mod export_task;
 pub mod headless;
 pub mod icons;
@@ -152,6 +153,7 @@ pub struct LightcraftApp {
     pub loupe_shown: Option<(lightcraft_catalog::PhotoId, &'static str)>,
     /// Photo Merge dialog previews and background merges.
     pub merge: merge::MergeState,
+    pub enhance: enhance::EnhanceState,
     /// An import in progress (the import review dialog's batches).
     pub import: Option<import::ImportTask>,
     /// A folder scan in progress (feeds the import review).
@@ -204,6 +206,7 @@ impl LightcraftApp {
             gesture: None,
             loupe_shown: None,
             merge: merge::MergeState::default(),
+            enhance: enhance::EnhanceState::default(),
             import: None,
             scan: None,
             export: None,
@@ -343,7 +346,7 @@ impl LightcraftApp {
             return;
         }
         let now = now_ms();
-        let busy = self.renderer.in_flight() > 0 || self.merge.busy();
+        let busy = self.renderer.in_flight() > 0 || self.merge.busy() || self.enhance.task.is_some();
         let mut shots = std::mem::take(&mut self.pending_screenshots);
         let mut shadow_ticked = false;
         shots.retain_mut(|s| {
@@ -467,6 +470,7 @@ impl LightcraftApp {
         }
         self.renderer.poll(ctx, &mut self.session);
         merge::poll(self, ctx);
+        enhance::poll(self, ctx);
         import::poll_scan(self, ctx);
         import::tick(self, ctx);
         self.preview_build_status(ctx);
