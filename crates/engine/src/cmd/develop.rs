@@ -484,6 +484,33 @@ pub fn specs() -> Vec<CommandSpec> {
                 Ok(())
             })
         }),
+        // ---- HDR editing
+        cmd!(
+            "develop.hdr",
+            "HDR",
+            [],
+            None,
+            "{enabled?: bool (default: toggle), maxEv?: number 0..5 (headroom limit, stops above SDR white)} — HDR editing: highlights above SDR white for HDR exports and displays; every SDR render uses the SDR rendition (the hdr.sdr* controls)",
+            has_active,
+            |s, p| {
+                let id = active(s, "develop.hdr")?;
+                let cur = s.develop_of(id).unwrap_or_default().hdr;
+                let enabled = bool_or(p, "enabled", !cur.enabled);
+                let max_ev = match p.get("maxEv") {
+                    None => None,
+                    Some(v) => Some(v.as_f64().filter(|x| x.is_finite()).ok_or_else(|| bad("develop.hdr", "`maxEv` must be a number"))?),
+                };
+                let label = if enabled { "HDR On" } else { "HDR Off" };
+                edit(s, "develop.hdr", label, |d| {
+                    d.hdr.enabled = enabled;
+                    if let Some(m) = max_ev {
+                        d.hdr.max_ev = m.clamp(0.0, lightcraft_develop::Hdr::MAX_EV_LIMIT);
+                    }
+                    Ok(())
+                })?;
+                Ok(json!({"enabled": enabled, "maxEv": s.develop_of(id).map(|d| d.hdr.max_ev)}))
+            }
+        ),
         // ---- geometry: Upright
         cmd!(
             "geometry.upright",

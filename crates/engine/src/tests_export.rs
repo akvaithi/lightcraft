@@ -207,3 +207,55 @@ fn export_falls_back_to_the_cpu_when_gpu_work_is_lost() {
     assert!(m > 0.02, "not black: mean {m}");
     assert!((m - healthy).abs() < 0.01, "GPU {healthy} vs CPU {m}");
 }
+
+/// The demo library's ocean sunset (a sun far above SDR white), selected and active.
+fn sunset(s: &mut Session) -> lightcraft_catalog::PhotoId {
+    let id = s.catalog.photos().find(|p| p.meta.title == "Golden horizon").map(|p| p.id).unwrap();
+    s.execute("library.select", &json!({"ids": [id.0]})).unwrap();
+    id
+}
+
+#[test]
+fn hdr_jpeg_export_writes_a_gain_map_and_sdr_edits_stay_plain() {
+    use lightcraft_codecs::gainmap;
+    let mut s = Session::with_demo();
+    let id = sunset(&mut s);
+    let o = ExportOptions::from_json(&json!({"longEdge": 320, "hdr": true}));
+    assert!(o.hdr_output());
+    // no HDR edit: an ordinary JPEG even with HDR output asked for
+    let plain = export_photo(&mut s, id, &o, 1).unwrap();
+    assert!(!gainmap::is_gain_map_jpeg(&plain.bytes));
+
+    let r = s.execute("develop.hdr", &json!({"enabled": true, "maxEv": 3})).unwrap();
+    assert_eq!(r["enabled"], true);
+    let e = export_photo(&mut s, id, &o, 1).unwrap();
+    assert!(gainmap::is_gain_map_jpeg(&e.bytes));
+    let gm = gainmap::read_jpeg(&e.bytes).unwrap();
+    assert!(gm.meta.alternate_headroom > 0.5 && gm.meta.alternate_headroom <= 3.05, "headroom {}", gm.meta.alternate_headroom);
+    // the base is the SDR rendition: the same pixels as the SDR export (the decoders agree)
+    let a = lightcraft_codecs::decode(&e.bytes, Default::default()).unwrap();
+    let b = lightcraft_codecs::decode(&plain.bytes, Default::default()).unwrap();
+    assert_eq!((a.width, a.height), (b.width, b.height));
+    let diff = a.image.data.iter().zip(&b.image.data).map(|(p, q)| (p[1] - q[1]).abs()).fold(0.0f32, f32::max);
+    assert!(diff < 0.02, "base differs from the SDR export by {diff}");
+    // HDR off again: the gain map goes away
+    s.execute("develop.hdr", &json!({"enabled": false})).unwrap();
+    assert!(!gainmap::is_gain_map_jpeg(&export_photo(&mut s, id, &o, 1).unwrap().bytes));
+}
+
+#[test]
+fn hdr_float_tiff_keeps_highlights_above_white() {
+    let mut s = Session::with_demo();
+    let id = sunset(&mut s);
+    s.execute("develop.hdr", &json!({"enabled": true, "maxEv": 2})).unwrap();
+    let max_of = |s: &mut Session, hdr: bool| {
+        let o = ExportOptions::from_json(&json!({"longEdge": 240, "format": "tiff", "bitDepth": 32, "hdr": hdr}));
+        let e = export_photo(s, id, &o, 1).unwrap();
+        let d = lightcraft_codecs::decode(&e.bytes, Default::default()).unwrap();
+        d.image.data.iter().flat_map(|p| p.iter().copied()).fold(0.0f32, f32::max)
+    };
+    let hdr = max_of(&mut s, true);
+    let sdr = max_of(&mut s, false);
+    assert!(sdr <= 1.0 + 1e-3, "SDR float TIFF stays in 0..1 ({sdr})");
+    assert!(hdr > 1.2 && hdr <= 4.0 + 1e-3, "HDR float TIFF max {hdr}");
+}

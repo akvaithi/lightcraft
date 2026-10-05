@@ -110,7 +110,7 @@ impl Backend for Headless {
             "engine.commands" => {
                 let mut v: Vec<Value> = self.session.commands().into_iter().map(|c| serde_json::to_value(c).unwrap_or_default()).collect();
                 v.push(json!({"id": "app.export", "label": "Export Now", "menu": [], "shortcut": null,
-                    "params": "{path?: output file (.jpg/.png/.tif/.webp/.avif/.dng) | dir?, ids?, format?: jpeg|png|tiff|webp|avif|dng|original, longEdge?|shortEdge?|width?|height?|megapixels?|percent? (default longEdge 3000; longEdge 0 = full size), dontEnlarge?, ppi?, quality?, limitKb?, colorSpace?, bitDepth?, sharpen?, metadata?, watermark?, naming?}",
+                    "params": "{path?: output file (.jpg/.png/.tif/.webp/.avif/.dng) | dir?, ids?, format?: jpeg|png|tiff|webp|avif|dng|original, longEdge?|shortEdge?|width?|height?|megapixels?|percent? (default longEdge 3000; longEdge 0 = full size), dontEnlarge?, ppi?, quality?, limitKb?, colorSpace?, bitDepth?, hdr? (HDR output for HDR edits: gain map JPEG, float TIFF), sharpen?, metadata?, watermark?, naming?}",
                     "enabled": self.session.active().is_some()}));
                 Ok(Value::Array(v))
             }
