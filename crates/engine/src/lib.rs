@@ -15,6 +15,7 @@ pub mod crs;
 pub mod crs_masks;
 pub mod demo;
 pub mod devices;
+pub mod enhance;
 pub mod export;
 pub mod files;
 pub mod guard;
@@ -175,6 +176,8 @@ pub struct Session {
     /// Untouched Local records of folders not browsed for this many days are forgotten when the
     /// library opens (0 = never; persisted in prefs.json). See `cmd/browse.rs`.
     pub forget_local_days: u32,
+    /// AI Denoise settings (persisted in prefs.json; environment variables override them).
+    pub denoise: enhance::DenoisePrefs,
 }
 
 impl Default for Session {
@@ -236,6 +239,7 @@ impl Session {
             cache_mb: 0,
             smart_previews_dir: None,
             forget_local_days: lightcraft_catalog::DEFAULT_FORGET_DAYS,
+            denoise: Default::default(),
         }
     }
 
@@ -613,6 +617,8 @@ pub fn json_delta(old: &Value, new: &Value) -> Option<Value> {
 mod tests;
 #[cfg(test)]
 mod tests_color;
+#[cfg(test)]
+mod tests_enhance;
 #[cfg(test)]
 mod tests_export;
 #[cfg(test)]

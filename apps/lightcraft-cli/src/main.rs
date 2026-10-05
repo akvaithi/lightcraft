@@ -7,6 +7,7 @@
 //! lightcraft-cli snapshot [--library DIR | --demo] [--script FILE.jsonl] [-o OUT.png] [--size WxH] [--scale S] [FILES…]
 //! lightcraft-cli merge hdr|panorama|hdr-panorama [OPTIONS] FILES…
 //! lightcraft-cli synth-merge hdr|panorama -o DIR
+//! lightcraft-cli denoise-serve --model FILE [--listen ADDR] [--token-env VAR] [--cpu]
 //! lightcraft-cli commands [--json]
 //! lightcraft-cli controls [--json]
 //! ```
@@ -82,6 +83,16 @@ USAGE:
         --preview OUT.png   only render a ≤ 1024 px preview (nothing written next to the files)
   lightcraft-cli synth-merge hdr|panorama -o DIR
       Write synthetic merge inputs (procedural scene; bracketed DNGs or overlapping PNG views).
+  lightcraft-cli denoise-serve --model FILE.lcdn [OPTIONS]
+      Serve AI Denoise tiles to other machines' LightCraft (`denoise.preferences {remote, token}`
+      or LIGHTCRAFT_DENOISE_URL / LIGHTCRAFT_DENOISE_TOKEN there). Runs on this machine's GPU when
+      it has one, else the CPU. Plain TCP: listen on a VPN/LAN address (e.g. the Tailscale IP) or
+      firewall the port to it. Options:
+        --listen ADDR     address:port to listen on (default 127.0.0.1:7990)
+        --token-env VAR   environment variable holding the shared token, ≥ 16 characters
+                          (default LIGHTCRAFT_DENOISE_TOKEN)
+        --cpu             don't use the GPU
+        --max-connections N   concurrent clients (default 8)
   lightcraft-cli commands [--json]   list every command id with its parameters
   lightcraft-cli controls [--json]   list every develop control id with its range
   lightcraft-cli --version | --help
@@ -114,6 +125,7 @@ fn main() -> ExitCode {
         Some("merge") => merge(&args[1..]),
         Some("synth-merge") => synth_merge(&args[1..]),
         Some("controls") => controls(&args[1..]),
+        Some("denoise-serve") => denoise_serve(&args[1..]),
         Some("--version" | "-V" | "version") => {
             println!("lightcraft-cli {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -741,4 +753,49 @@ fn controls(args: &[String]) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// `denoise-serve`: the remote half of AI Denoise (see `lightcraft_denoise::remote`).
+fn denoise_serve(args: &[String]) -> Result<(), String> {
+    let mut model: Option<String> = None;
+    let mut listen = format!("127.0.0.1:{}", lightcraft_denoise::remote::DEFAULT_PORT);
+    let mut token_env = "LIGHTCRAFT_DENOISE_TOKEN".to_string();
+    let mut cpu = false;
+    let mut max_connections = 8usize;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--model" => model = Some(take_value(args, &mut i, "--model")?.to_string()),
+            "--listen" => listen = take_value(args, &mut i, "--listen")?.to_string(),
+            "--token-env" => token_env = take_value(args, &mut i, "--token-env")?.to_string(),
+            "--cpu" => cpu = true,
+            "--max-connections" => {
+                max_connections = take_value(args, &mut i, "--max-connections")?.parse().map_err(|_| "--max-connections expects a number")?
+            }
+            other => return Err(format!("denoise-serve: unknown option `{other}`")),
+        }
+        i += 1;
+    }
+    let path = model.ok_or("denoise-serve: --model FILE.lcdn is required")?;
+    let model = lightcraft_engine::enhance::load_model(&path).map_err(|e| e.to_string())?;
+    let token = std::env::var(&token_env).map_err(|_| format!("denoise-serve: set the shared token in ${token_env}"))?;
+    let backend: std::sync::Arc<dyn lightcraft_denoise::Backend + Send> = match (cpu, lightcraft_gpu::denoise::backend()) {
+        (false, Some(g)) => std::sync::Arc::from(g),
+        _ => std::sync::Arc::new(lightcraft_denoise::Cpu),
+    };
+    let listener = std::net::TcpListener::bind(&listen).map_err(|e| format!("denoise-serve: {listen}: {e}"))?;
+    eprintln!(
+        "lightcraft-cli denoise-serve: {} ({}, {:.0} kMAC/px) on {} via {}",
+        model.header.name,
+        lightcraft_denoise::remote::hash_hex(model.hash),
+        model.macs_per_pixel() / 1000.0,
+        listen,
+        backend.name()
+    );
+    if listen.starts_with("0.0.0.0") || listen.starts_with("[::]") {
+        eprintln!("lightcraft-cli denoise-serve: listening on every interface; firewall the port to your VPN/LAN (the protocol is not encrypted)");
+    }
+    let opts = lightcraft_denoise::remote::ServerOptions { token, max_connections, ..Default::default() };
+    let log = std::sync::Arc::new(|m: &str| eprintln!("lightcraft-cli denoise-serve: {m}"));
+    lightcraft_denoise::remote::serve(listener, model, backend, opts, log).map_err(|e| e.to_string())
 }

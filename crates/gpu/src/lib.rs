@@ -24,6 +24,16 @@ use lightcraft_raster::Rgb32f;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod ctx;
+/// AI Denoise on the GPU (native only).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod denoise;
+/// AI Denoise on the GPU: none in the browser build.
+#[cfg(target_arch = "wasm32")]
+pub mod denoise {
+    pub fn backend() -> Option<Box<dyn lightcraft_denoise::Backend + Send>> {
+        None
+    }
+}
 #[cfg(not(target_arch = "wasm32"))]
 mod params;
 #[cfg(not(target_arch = "wasm32"))]

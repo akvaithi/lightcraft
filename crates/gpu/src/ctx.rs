@@ -31,6 +31,11 @@ const MODULES: &[Module] = &[
     },
     Module { src: include_str!("wgsl/blur.wgsl"), bindings: &[("src", false, "f32"), ("dst", true, "f32")], entries: &["box_h", "box_v"] },
     Module {
+        src: include_str!("wgsl/nn.wgsl"),
+        bindings: &[("x", false, "f32"), ("wt", false, "f32"), ("y", true, "f32")],
+        entries: &["nn_conv", "nn_up"],
+    },
+    Module {
         src: include_str!("wgsl/resize.wgsl"),
         bindings: &[("src", false, "f32"), ("table", false, "u32"), ("dst", true, "f32")],
         entries: &["resize_h", "resize_v"],

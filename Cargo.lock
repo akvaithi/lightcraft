@@ -2109,7 +2109,9 @@ version = "0.2.0"
 dependencies = [
  "dhat",
  "lightcraft-codecs",
+ "lightcraft-denoise",
  "lightcraft-engine",
+ "lightcraft-gpu",
  "lightcraft-mcp",
  "lightcraft-merge",
  "lightcraft-raster",
@@ -2186,6 +2188,7 @@ dependencies = [
  "lightcraft-catalog",
  "lightcraft-codecs",
  "lightcraft-color",
+ "lightcraft-denoise",
  "lightcraft-develop",
  "lightcraft-geom",
  "lightcraft-gpu",
@@ -2219,6 +2222,7 @@ version = "0.2.0"
 dependencies = [
  "bytemuck",
  "lightcraft-color",
+ "lightcraft-denoise",
  "lightcraft-develop",
  "lightcraft-geom",
  "lightcraft-pipeline",

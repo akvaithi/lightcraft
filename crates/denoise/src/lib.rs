@@ -8,12 +8,15 @@
 //!   [`Backend`]s (e.g. a remote GPU server, this machine's GPU, the CPU): a backend that fails
 //!   hands the rest of the image to the next one, and the [`Report`] says why.
 //!
+//! - [`remote`]: a TCP server running tiles on this machine's backend, and its client backend.
+//!
 //! The same code serves every backend, so a tile denoised remotely or locally differs only by the
 //! backends' float rounding.
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod model;
+pub mod remote;
 
 pub use model::{Model, Op, Tensor};
 

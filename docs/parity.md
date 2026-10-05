@@ -26,7 +26,7 @@ and prints the summary; `cargo xtask parity --write` refreshes the summary table
 | C. Views & navigation (VIEW) | 16 | 0 | 1 | 0 | 9/9 (100%) | 4/4 (100%) |
 | D. Search & filter (FILT) | 11 | 0 | 2 | 0 | 4/4 (100%) | 4/4 (100%) |
 | E. Metadata (META) | 5 | 1 | 0 | 0 | 2/2 (100%) | 2/2 (100%) |
-| F. Edit panel — global adjustments (EDIT) | 43 | 1 | 4 | 1 | 28/28 (100%) | 13/14 (93%) |
+| F. Edit panel — global adjustments (EDIT) | 43 | 2 | 3 | 1 | 28/28 (100%) | 13/14 (93%) |
 | G. Profiles (PROF) | 6 | 2 | 3 | 0 | 3/4 (75%) | 2/3 (67%) |
 | H. Crop & rotate (CROP) | 9 | 0 | 0 | 1 | 6/6 (100%) | 3/3 (100%) |
 | I. Remove / healing (REM) | 7 | 1 | 2 | 2 | 4/4 (100%) | 2/3 (67%) |
@@ -48,9 +48,9 @@ and prints the summary; `cargo xtask parity --write` refreshes the summary table
 | Y. Menus | 81 | 0 | 4 | 8 | 47/47 (100%) | 23/23 (100%) |
 | Z. Keyboard shortcuts (desktop) | 74 | 3 | 3 | 1 | 49/52 (94%) | 22/23 (96%) |
 | Lightroom Classic extras | 30 | 9 | 40 | 9 | — | 20/21 (95%) |
-| **Total** | 389 | 32 | 84 | 37 | 194/200 (97%) | 138/147 (94%) |
+| **Total** | 389 | 33 | 83 | 37 | 194/200 (97%) | 138/147 (94%) |
 
-Weighted completion (✅ = 1, 🟡 = ½, 🚫 left out): **80.2%** of 505 in-scope rows — P0 98.5% of 200 · P1 95.9% of 147 · P2 42.4% of 158.
+Weighted completion (✅ = 1, 🟡 = ½, 🚫 left out): **80.3%** of 505 in-scope rows — P0 98.5% of 200 · P1 95.9% of 147 · P2 42.7% of 158.
 <!-- /parity:summary -->
 
 ## Top gaps
@@ -249,7 +249,7 @@ under the UI command that wraps it (a no-op error); the UI command now wins.
 | LR-EDIT-DETAIL-SHARPEN | Sharpening | P0 | ✅ | `ctl:detail.sharpenAmount`, `ctl:detail.sharpenRadius`, `ctl:detail.sharpenDetail`, `ctl:detail.sharpenMasking` | no Alt-drag mask preview |
 | LR-EDIT-DETAIL-NR | Luminance noise reduction | P0 | ✅ | `ctl:detail.nrLuminance`, `ctl:detail.nrDetail`, `ctl:detail.nrContrast` | |
 | LR-EDIT-DETAIL-CNR | Colour noise reduction | P0 | ✅ | `ctl:detail.nrColor`, `ctl:detail.nrColorDetail`, `ctl:detail.nrColorSmoothness` | |
-| LR-EDIT-DETAIL-DENOISE | AI denoise | P2 | ⬜ | | settings field reserved, not rendered |
+| LR-EDIT-DETAIL-DENOISE | AI denoise | P2 | 🟡 | `cmd:enhance.denoise`, `cmd:denoise.status`, `cmd:denoise.preferences`, `crates/denoise/src/lib.rs`, `crates/gpu/src/denoise.rs`, `docs/remote-denoise.md` | learned denoiser on demosaiced raw data → Enhanced-NR DNG stacked on the original; CPU, GPU (WGSL) and remote-GPU backends with fallback; no trained weights ship yet (the model is a separate .lcdn file); no Enhance dialog yet (command only) |
 | LR-EDIT-DETAIL-RAWDETAILS | Improved demosaic toggle | P2 | ⬜ | | |
 | LR-EDIT-DETAIL-SUPERRES | Super resolution | P2 | ⬜ | | |
 | LR-EDIT-DETAIL-AISHARPEN | AI sharpen | OOS | 🚫 | | |

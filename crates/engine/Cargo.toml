@@ -24,6 +24,7 @@ lightcraft-raw = { workspace = true }
 lightcraft-meta = { workspace = true }
 miniz_oxide = { workspace = true }
 lightcraft-merge = { workspace = true }
+lightcraft-denoise = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
