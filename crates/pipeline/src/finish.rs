@@ -190,6 +190,9 @@ pub struct FinishParams {
     pub w: usize,
     pub h: usize,
     pub px_per_long: f64,
+    /// Peak linear output relative to SDR white: 1 for SDR renders; `2^max_ev` for an HDR render
+    /// ([`OutputDepth::F32Hdr`] with HDR on), which keeps values above 1 instead of clipping them.
+    pub peak: f32,
 }
 
 impl FinishParams {
@@ -218,13 +221,15 @@ impl FinishParams {
             ((s.grain.amount / 100.0) as f32 * 0.13, cell.max(0.6), (s.grain.roughness / 100.0) as f32, s.grain.seed)
         });
         let calibration = s.section_enabled("calibration");
+        let peak = s.hdr.peak();
         FinishParams {
+            peak,
             calib: if calibration { crate::colorops::calibration_matrix(&s.calibration) } else { None },
             shadow_tint: if calibration { (s.calibration.shadows_tint / 100.0) as f32 } else { 0.0 },
             tone: if info.raw {
-                ToneMap::new(s.light.contrast, s.light.whites, s.light.blacks)
+                ToneMap::hdr(s.light.contrast, s.light.whites, s.light.blacks, peak)
             } else {
-                ToneMap::display(s.light.contrast, s.light.whites, s.light.blacks)
+                ToneMap::display_hdr(s.light.contrast, s.light.whites, s.light.blacks, peak)
             },
             lut: crate::lut::get(&s.profile.id).map(|l| (l, (s.profile.amount / 100.0).clamp(0.0, 2.0) as f32)),
             ops: ColorOps::new(s),
@@ -293,6 +298,12 @@ pub(crate) fn finish_deep(
             let v = finish_with(p, &fp, true, |e| e.map(|v| srgb_to_linear(v.clamp(0.0, 1.0))));
             DeepSamples::F32(v.into_flattened())
         }
+        OutputDepth::F32Hdr => {
+            // the sRGB curve extended past 1 (it is unbounded), so values up to `peak` survive
+            let peak = fp.peak;
+            let v = finish_with(p, &fp, true, |e| e.map(|v| srgb_to_linear(v.max(0.0)).clamp(0.0, peak)));
+            DeepSamples::F32(v.into_flattened())
+        }
         _ => {
             let q = |v: f32| (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
             let v = finish_with(p, &fp, true, |e| match trc {
@@ -345,6 +356,8 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
     let aspect = w as f32 / h as f32;
 
     let srgb = srgb_lut();
+    let peak = fp.peak;
+    let hdr = peak > 1.0;
     let mut out = vec![T::default(); w * h];
     for_rows(&mut out, w, |y, row| {
         for (x, px) in row.iter_mut().enumerate() {
@@ -482,8 +495,8 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             let o = tone.apply(yl);
             let mut d = if yl > 1e-9 { c.map(|v| v * o / yl) } else { [0.0; 3] };
             let mx = d[0].max(d[1]).max(d[2]);
-            if mx > 1.0 {
-                let t = ((mx - 1.0) / (mx - o).max(1e-6)).clamp(0.0, 1.0);
+            if mx > peak {
+                let t = ((mx - peak) / (mx - o).max(1e-6)).clamp(0.0, 1.0);
                 d = d.map(|v| v + (o - v) * t);
             }
 
@@ -515,6 +528,9 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                         } else {
                             d = d.map(|c| c * f);
                         }
+                    } else if hdr {
+                        // lighten towards SDR white; never pull HDR highlights down to it
+                        d = d.map(|c| c + (1.0 - c).max(0.0) * v.amount * t * 0.85);
                     } else {
                         d = d.map(|c| c + (1.0 - c) * v.amount * t * 0.85);
                     }
@@ -527,7 +543,7 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             let mut r = match &fp.proof {
                 Some(pp) => {
                     let q0 = mul3(&pp.to_proof, d);
-                    let (q, t) = gamut_map(q0, pp.luma);
+                    let (q, t) = gamut_map_to(q0, pp.luma, peak);
                     if pp.dest_warning && out_of_gamut(q0, t) {
                         warn = Some(crate::output::PROOF_DEST_WARNING);
                     }
@@ -535,17 +551,37 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                 }
                 None => mul3(to_out, d),
             };
-            let (mapped, t) = gamut_map(r, *out_luma);
+            let (mapped, t) = gamut_map_to(r, *out_luma, peak);
             if fp.proof.is_some_and(|pp| pp.display_warning) && warn.is_none() && out_of_gamut(r, t) {
                 warn = Some(crate::output::PROOF_DISPLAY_WARNING);
             }
             r = mapped;
 
             // --- encode, curves, grain
-            let mut e = if exact { r.map(|v| linear_to_srgb(v.clamp(0.0, 1.0))) } else { r.map(|v| encode_srgb(srgb, v)) };
+            let mut e = if hdr {
+                // HDR: the (unbounded) sRGB curve, so values above SDR white encode above 1
+                r.map(|v| {
+                    if v > 1.0 {
+                        linear_to_srgb(v)
+                    } else if exact {
+                        linear_to_srgb(v.max(0.0))
+                    } else {
+                        encode_srgb(srgb, v)
+                    }
+                })
+            } else if exact {
+                r.map(|v| linear_to_srgb(v.clamp(0.0, 1.0)))
+            } else {
+                r.map(|v| encode_srgb(srgb, v))
+            };
             if let Some(l) = curves {
                 let e0 = e;
-                e = [l[0].eval(e[0]), l[1].eval(e[1]), l[2].eval(e[2])];
+                e = if hdr {
+                    // above SDR white the curves continue with slope 1 from their end point
+                    std::array::from_fn(|k| if e[k] > 1.0 { l[k].eval(1.0) + (e[k] - 1.0) } else { l[k].eval(e[k]) })
+                } else {
+                    [l[0].eval(e[0]), l[1].eval(e[1]), l[2].eval(e[2])]
+                };
                 if fp.refine_sat < 1.0 {
                     e = refine_saturation(e0, e, fp.refine_sat);
                 }
@@ -556,11 +592,20 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                 let sc = fp.px_per_long as f32 / cell;
                 let mut g = grain_noise(gx * sc, gy * sc, seed);
                 g = g * (1.0 - rough * 0.5) + grain_noise(gx * sc * 2.3, gy * sc * 2.3, seed ^ 0x55) * rough * 0.7;
-                let lum = 0.2126 * e[0] + 0.7152 * e[1] + 0.0722 * e[2];
+                let mut lum = 0.2126 * e[0] + 0.7152 * e[1] + 0.0722 * e[2];
+                if hdr {
+                    lum = lum.clamp(0.0, 1.0);
+                }
                 let k = amt * g * (0.35 + 2.6 * lum * (1.0 - lum));
                 e = e.map(|v| v + k);
             }
             let e = match &p_lut {
+                Some((l, k)) if hdr => {
+                    // the LUT sees SDR values; the part above SDR white is carried over
+                    let c = e.map(|v| v.clamp(0.0, 1.0));
+                    let m = l.apply(c);
+                    [e[0] + (m[0] - c[0]) * k, e[1] + (m[1] - c[1]) * k, e[2] + (m[2] - c[2]) * k]
+                }
                 Some((l, k)) => {
                     let m = l.apply(e.map(|v| v.clamp(0.0, 1.0)));
                     [e[0] + (m[0] - e[0]) * k, e[1] + (m[1] - e[1]) * k, e[2] + (m[2] - e[2]) * k]
@@ -598,13 +643,19 @@ fn mul3(m: &[[f32; 3]; 3], d: [f32; 3]) -> [f32; 3] {
 /// returns the mapped colour and the chroma scale used (1 = already in gamut).
 #[inline]
 pub fn gamut_map(r: [f32; 3], luma: [f32; 3]) -> ([f32; 3], f32) {
-    let yy = (luma[0] * r[0] + luma[1] * r[1] + luma[2] * r[2]).clamp(0.0, 1.0);
+    gamut_map_to(r, luma, 1.0)
+}
+
+/// [`gamut_map`] into `0..peak` (an HDR render's range; `peak` = 1 is [`gamut_map`]).
+#[inline]
+pub fn gamut_map_to(r: [f32; 3], luma: [f32; 3], peak: f32) -> ([f32; 3], f32) {
+    let yy = (luma[0] * r[0] + luma[1] * r[1] + luma[2] * r[2]).clamp(0.0, peak);
     let mut t = 1.0f32;
     for c in r {
         if c < 0.0 {
             t = t.min(yy / (yy - c).max(1e-9));
-        } else if c > 1.0 {
-            t = t.min((1.0 - yy) / (c - yy).max(1e-9));
+        } else if c > peak {
+            t = t.min((peak - yy) / (c - yy).max(1e-9));
         }
     }
     if t < 1.0 { (r.map(|c| yy + (c - yy) * t), t) } else { (r, 1.0) }

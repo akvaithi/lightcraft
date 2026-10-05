@@ -192,6 +192,9 @@ pub enum OutputDepth {
     U16,
     /// 32-bit float *linear* RGB (target primaries, 0..1) in [`crate::Rendered::deep`].
     F32Linear,
+    /// 32-bit float linear RGB (target primaries) of the HDR render: SDR white = 1, highlights up
+    /// to [`lightcraft_develop::Hdr::peak`]. With HDR off this is [`OutputDepth::F32Linear`].
+    F32Hdr,
 }
 
 /// High-bit-depth RGB samples (3 per pixel, interleaved, row-major).

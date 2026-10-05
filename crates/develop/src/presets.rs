@@ -98,7 +98,7 @@ impl SettingsGroup {
             SettingsGroup::Profile => &["profile"],
             SettingsGroup::Treatment => &["treatment"],
             SettingsGroup::WhiteBalance => &["wb"],
-            SettingsGroup::Light => &["light"],
+            SettingsGroup::Light => &["light", "hdr"],
             SettingsGroup::ToneCurve => &["curve"],
             SettingsGroup::Color => &["color"],
             SettingsGroup::ColorMixer => &["mixer", "bw_mix", "point_colors"],
