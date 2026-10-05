@@ -369,6 +369,7 @@ enum Src<'a> {
 }
 
 fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &RenderRequest, cache: Option<&StageCache>) -> Rendered {
+    let edit = s;
     let s = &*settings_for(s, req);
     // `Instant::now()` panics on wasm32-unknown-unknown: only read the clock when profiling.
     let lap = |what: &str, t: &mut Option<std::time::Instant>| {
@@ -431,6 +432,14 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
     let mut image = image;
     let mask = overlay_alpha(req.overlay, &plan, &prep);
     visualize::apply(&mut image, req.overlay, &plan, mask.as_ref());
+    if req.overlay == Overlay::HdrRange && edit.hdr.enabled {
+        // the HDR rendition of the same request says how far above SDR white each pixel goes
+        let hreq = RenderRequest { depth: OutputDepth::F32Hdr, overlay: Overlay::None, proof: None, ..*req };
+        if let Some(hdr) = render(src_img, info, edit, &hreq).deep {
+            visualize::hdr_range(&mut image, &hdr, req.space.luma());
+        }
+        lap("visualize hdr", &mut t);
+    }
     Rendered { image, histogram, deep: None }
 }
 

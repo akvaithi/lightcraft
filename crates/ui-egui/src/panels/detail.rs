@@ -546,6 +546,9 @@ pub(crate) fn view_overlay(app: &LightcraftApp, d: &DevelopSettings) -> lightcra
     if edit && app.ui.point_color_visualize && app.ui.flyout_open("pointColor") && app.ui.point_color < d.point_colors.len() {
         return Overlay::PointColorRange(app.ui.point_color as u8);
     }
+    if edit && app.ui.hdr_visualize && d.hdr.enabled {
+        return Overlay::HdrRange;
+    }
     Overlay::None
 }
 

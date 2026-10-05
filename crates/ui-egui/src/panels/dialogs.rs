@@ -456,6 +456,13 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                         choices(ui, "Bit depth", "exportBitDepth", depths, &mut bd);
                         opts.bit_depth = Some(bd);
                     }
+                    if matches!(opts.format, F::Jpeg | F::Tiff) {
+                        let tip = "Photos edited in HDR: JPEG with an HDR gain map (looks right everywhere, brighter highlights on HDR displays); TIFF needs 32-bit float";
+                        ui.checkbox(&mut opts.hdr, "HDR output").on_hover_text(tip);
+                        if opts.hdr && !opts.hdr_output() {
+                            ui.label(egui::RichText::new("HDR TIFF needs 32-bit float.").color(t.text_dim));
+                        }
+                    }
                     if !rendered {
                     } else if opts.format == F::Avif {
                         ui.label(egui::RichText::new("Color space: sRGB (AVIF)").color(t.text_dim));

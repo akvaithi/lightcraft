@@ -39,6 +39,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     ("view.zoomIn", "Zoom In", Some("Cmd+="), "View"),
     ("view.zoomOut", "Zoom Out", Some("Cmd+-"), "View"),
     ("view.clipping", "Show Clipping", Some("J"), "View"),
+    ("view.visualizeHdr", "Visualize HDR", None, "View"),
     // in grids S expands/collapses stacks (the engine command it shadows)
     ("view.softProof", "Soft Proofing", Some("S"), "View"),
     ("view.histogram", "Histogram", Some("Cmd+Shift+H"), "View"),
@@ -445,6 +446,11 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
         "view.clipping" => {
             app.ui.show_clipping = !app.ui.show_clipping;
             Ok(Value::Null)
+        }
+        "view.visualizeHdr" => {
+            // {on?}; no params toggles. Shown on photos edited in HDR (see `develop.hdr`).
+            app.ui.hdr_visualize = p.get("on").and_then(Value::as_bool).unwrap_or(!app.ui.hdr_visualize);
+            Ok(json!({"on": app.ui.hdr_visualize}))
         }
         "view.softProof" => {
             // {on?, space?, destWarning?, displayWarning?}; no params toggles
