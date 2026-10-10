@@ -168,7 +168,11 @@ struct Network {
 #[cfg(feature = "denoise")]
 struct RemoteSide {
     runner: lightcraft_denoise::remote::Remote,
-    greeted: OnceLock<Result<lightcraft_denoise::remote::ServerInfo, String>>,
+    /// The greeting, and the server's time for the check tile there and back (ms; the faster of two runs).
+    greeted: OnceLock<Result<(lightcraft_denoise::remote::ServerInfo, f64), String>>,
+    /// Whether the photo started last shares tiles with the server, and if not because it is slower, the two times.
+    share: AtomicBool,
+    slower: Mutex<Option<(f64, f64)>>,
 }
 
 #[cfg(feature = "denoise")]
@@ -178,12 +182,33 @@ impl RemoteSide {
         let var = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         let address = var("LIGHTCRAFT_DENOISE_URL")?;
         let token = var("LIGHTCRAFT_DENOISE_TOKEN").unwrap_or_default();
-        Some(RemoteSide { runner: lightcraft_denoise::remote::Remote::new(&address, &token, sha256, tile), greeted: OnceLock::new() })
+        Some(RemoteSide::new(lightcraft_denoise::remote::Remote::new(&address, &token, sha256, tile)))
+    }
+
+    fn new(runner: lightcraft_denoise::remote::Remote) -> RemoteSide {
+        RemoteSide { runner, greeted: OnceLock::new(), share: AtomicBool::new(false), slower: Mutex::new(None) }
+    }
+
+    /// Greet the server and time a check tile there and back: a server behind a slow link can take seconds a tile, and
+    /// handing it tiles a fast local card would finish sooner only makes the photo wait for it.
+    fn greet(&self) -> Result<(lightcraft_denoise::remote::ServerInfo, f64), String> {
+        let info = self.runner.hello().map_err(|e| e.to_string())?;
+        let input = lightcraft_denoise::runtime::check_tile(info.tile);
+        let mut best = f64::INFINITY;
+        for _ in 0..2 {
+            let started = web_time::Instant::now();
+            match self.runner.try_run(&input) {
+                Some(Ok(_)) => best = best.min(started.elapsed().as_secs_f64() * 1000.0),
+                Some(Err(e)) => return Err(format!("the check tile failed: {e}")),
+                None => return Err("no free slot for the check tile".into()),
+            }
+        }
+        Ok((info, best))
     }
 
     /// The server when it can take tiles now (greeting it the first time), else why not.
     fn usable(&self, start: bool) -> Result<&lightcraft_denoise::remote::Remote, String> {
-        let greeted = if start { Some(self.greeted.get_or_init(|| self.runner.hello().map_err(|e| e.to_string()))) } else { self.greeted.get() };
+        let greeted = if start { Some(self.greeted.get_or_init(|| self.greet())) } else { self.greeted.get() };
         match greeted {
             None => Err("not contacted yet".into()),
             Some(Err(why)) => Err(why.clone()),
@@ -194,12 +219,28 @@ impl RemoteSide {
         }
     }
 
+    /// The server's time for a tile, once greeted.
+    fn tile_ms(&self) -> Option<f64> {
+        self.greeted.get().and_then(|g| g.as_ref().ok()).map(|g| g.1)
+    }
+
     fn describe(&self) -> Value {
         match self.greeted.get() {
             None => json!({"address": self.runner.address(), "state": "pending"}),
             Some(Err(why)) => json!({"address": self.runner.address(), "state": "unavailable", "reason": why}),
-            Some(Ok(info)) => {
-                let mut v = json!({"address": info.address, "device": info.device, "state": if self.runner.healthy() { "used" } else { "given up" }, "failures": self.runner.failures()});
+            Some(Ok((info, ms))) => {
+                let slower = *self.slower.lock().unwrap_or_else(PoisonError::into_inner);
+                let state = match () {
+                    _ if !self.runner.healthy() => "given up",
+                    _ if slower.is_some() => "slower",
+                    _ if self.share.load(Ordering::Relaxed) => "used",
+                    _ => "idle",
+                };
+                let mut v =
+                    json!({"address": info.address, "device": info.device, "state": state, "remoteMs": ms, "failures": self.runner.failures()});
+                if let (Some((_, local)), Some(o)) = (slower, v.as_object_mut()) {
+                    o.insert("localMs".into(), json!(local));
+                }
                 if let (Some(e), Some(o)) = (self.runner.last_error(), v.as_object_mut()) {
                     o.insert("lastError".into(), json!(e));
                 }
@@ -393,7 +434,7 @@ impl Network {
 #[cfg(feature = "denoise")]
 impl TileRunner for Network {
     fn run(&self, input: &[f32]) -> Result<Vec<f32>, RunError> {
-        if let Some(Ok(remote)) = self.remote.as_ref().map(|r| r.usable(false))
+        if let Some(Ok(remote)) = self.remote.as_ref().filter(|r| r.share.load(Ordering::Relaxed)).map(|r| r.usable(false))
             && let Some(Ok(out)) = remote.try_run(input)
         {
             return Ok(out);
@@ -425,12 +466,32 @@ impl Model for Network {
             Err(_) => (false, threads),
         };
         self.local_card.store(card, Ordering::Relaxed);
-        match self.remote.as_ref().map(|r| r.usable(true)) {
-            // the server's slots come on top of this computer's own tiles at once
-            Some(Ok(remote)) => (self, local + remote.slots()),
-            _ if card => (self, local),
-            _ => (&self.cpu, local),
+        if let Some(r) = &self.remote {
+            // this computer's time for a tile: the card's, or the CPU's with `threads` tiles sharing it (as
+            // `card_is_faster` counts them); unknown when the card was never set up (then the server is used)
+            let local_ms = match self.gpu.get() {
+                Some(Ok(g)) if card => g.card_ms,
+                Some(Ok(g)) => g.cpu_ms / (1.0 + 0.5 * threads.saturating_sub(1) as f64),
+                _ => f64::INFINITY,
+            };
+            let share = match (r.usable(true), r.tile_ms()) {
+                (Ok(_), Some(ms)) if ms < local_ms => {
+                    *r.slower.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                    true
+                }
+                (Ok(_), Some(ms)) => {
+                    *r.slower.lock().unwrap_or_else(PoisonError::into_inner) = Some((ms, local_ms));
+                    false
+                }
+                _ => false,
+            };
+            r.share.store(share, Ordering::Relaxed);
+            if let (true, Ok(remote)) = (share, r.usable(false)) {
+                // the server's slots come on top of this computer's own tiles at once
+                return (self, local + remote.slots());
+            }
         }
+        if card { (self, local) } else { (&self.cpu, local) }
     }
 
     fn self_test(&self, run_on: RunOn) -> Result<Value, String> {
@@ -1660,10 +1721,7 @@ mod gpu_tests {
             overlap: 16,
             gain: Gain::MatchMean { nominal: 1.0, max_deviation: 0.05 },
         };
-        let remote = RemoteSide {
-            runner: lightcraft_denoise::remote::Remote::new(addr, "remote-test-token-0123", sha256, tile as usize),
-            greeted: OnceLock::new(),
-        };
+        let remote = RemoteSide::new(lightcraft_denoise::remote::Remote::new(addr, "remote-test-token-0123", sha256, tile as usize));
         network(path, &manifest, Some(remote)).unwrap()
     }
 
@@ -1682,6 +1740,15 @@ mod gpu_tests {
         let d = net.device(RunOn::Cpu);
         assert_eq!(d["remote"]["state"], "used", "{d}");
         assert_eq!(d["remote"]["device"], "CPU (test server)");
+        // a local card faster than the server there and back (here a stand-in that takes no time): nothing is shared,
+        // the photo never waits for the slower server, and the status says why
+        let mut net = with_remote(&path, 64, &addr, &sha);
+        net.gpu = OnceLock::from(Ok(GpuSide { runner: Box::new(cpu.clone()), adapter: "Fast card".into(), card_ms: 1e-6, cpu_ms: 1000.0 }));
+        let (_, at_once) = net.runner(RunOn::Gpu, 8);
+        assert_eq!(at_once, GPU_PARALLEL, "no server slots");
+        let d = net.device(RunOn::Gpu);
+        assert_eq!(d["remote"]["state"], "slower", "{d}");
+        assert!(d["remote"]["remoteMs"].as_f64().is_some_and(|ms| ms > 0.0) && d["remote"]["localMs"].as_f64().is_some(), "{d}");
         // a server running another model is refused: everything runs here
         let other = server(lightcraft_denoise::runtime::CpuRunner::load(&path, &cpu.manifest().clone()).unwrap(), "0000", 64);
         let net = with_remote(&path, 64, &other, &sha);

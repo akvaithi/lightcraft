@@ -138,9 +138,14 @@ export LIGHTCRAFT_DENOISE_URL=100.101.102.103:7990
 export LIGHTCRAFT_DENOISE_TOKEN='…the same token…'
 ```
 
-The server's slots (four tiles in flight) are added to the laptop's own: a tile goes to the server when one of its
-slots is free and runs locally otherwise, so a server behind a slow link still adds speed instead of costing it. A
-tile the server fails runs locally; after three failures the server is no longer used for that model. Both ends must
+When the laptop first uses the model it greets the server and times a check tile there and back. If that is faster
+than a tile on the laptop (its graphics card, or its processor with the tiles it runs at once), the server's slots
+(four tiles in flight) are added to the laptop's own: a tile goes to the server when one of its slots is free and runs
+locally otherwise. If it is slower, nothing is sent, so a photo never waits for the slower machine:
+`denoise.status` → `device.remote.state` is `slower`, with both times (`remoteMs`, `localMs`). Measured with
+RawNIND: an Apple M3 laptop does a tile in 116 ms, an RTX 3060 Ti reached over Tailscale 345 ms there and back,
+so that laptop keeps its tiles; one without a fast card hands them over. A tile the server fails runs locally; after
+three failures the server is no longer used for that model. Both ends must
 run the same model file: the client compares the manifest's SHA-256 (or the file's) when it first greets the server,
 and the server checks it again for every tile. `denoise.status` → `device.remote` reports the server's address, its
 device and whether it is used, or why not.
