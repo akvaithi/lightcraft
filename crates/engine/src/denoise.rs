@@ -157,6 +157,56 @@ struct Network {
     fallbacks: AtomicUsize,
     /// Tiles at once of the photo started last (0: none yet), to say where the work runs.
     last_threads: AtomicUsize,
+    /// Another computer's graphics card (`LIGHTCRAFT_DENOISE_URL` + `LIGHTCRAFT_DENOISE_TOKEN`; see
+    /// `docs/denoise.md` → Another computer's graphics card), greeted on first use: it takes tiles while it has a free
+    /// slot, on top of this computer's runner.
+    remote: Option<RemoteSide>,
+    /// Whether this computer's share runs on the card (else the CPU), as chosen for the photo started last.
+    local_card: AtomicBool,
+}
+
+#[cfg(feature = "denoise")]
+struct RemoteSide {
+    runner: lightcraft_denoise::remote::Remote,
+    greeted: OnceLock<Result<lightcraft_denoise::remote::ServerInfo, String>>,
+}
+
+#[cfg(feature = "denoise")]
+impl RemoteSide {
+    /// From the environment, for the model whose file has `sha256` and tiles of `tile` cells.
+    fn from_env(sha256: &str, tile: usize) -> Option<RemoteSide> {
+        let var = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        let address = var("LIGHTCRAFT_DENOISE_URL")?;
+        let token = var("LIGHTCRAFT_DENOISE_TOKEN").unwrap_or_default();
+        Some(RemoteSide { runner: lightcraft_denoise::remote::Remote::new(&address, &token, sha256, tile), greeted: OnceLock::new() })
+    }
+
+    /// The server when it can take tiles now (greeting it the first time), else why not.
+    fn usable(&self, start: bool) -> Result<&lightcraft_denoise::remote::Remote, String> {
+        let greeted = if start { Some(self.greeted.get_or_init(|| self.runner.hello().map_err(|e| e.to_string()))) } else { self.greeted.get() };
+        match greeted {
+            None => Err("not contacted yet".into()),
+            Some(Err(why)) => Err(why.clone()),
+            Some(Ok(_)) if !self.runner.healthy() => {
+                Err(format!("it failed {} tiles ({})", self.runner.failures(), self.runner.last_error().unwrap_or_default()))
+            }
+            Some(Ok(_)) => Ok(&self.runner),
+        }
+    }
+
+    fn describe(&self) -> Value {
+        match self.greeted.get() {
+            None => json!({"address": self.runner.address(), "state": "pending"}),
+            Some(Err(why)) => json!({"address": self.runner.address(), "state": "unavailable", "reason": why}),
+            Some(Ok(info)) => {
+                let mut v = json!({"address": info.address, "device": info.device, "state": if self.runner.healthy() { "used" } else { "given up" }, "failures": self.runner.failures()});
+                if let (Some(e), Some(o)) = (self.runner.last_error(), v.as_object_mut()) {
+                    o.insert("lastError".into(), json!(e));
+                }
+                v
+            }
+        }
+    }
 }
 
 #[cfg(feature = "denoise")]
@@ -338,10 +388,19 @@ impl Network {
     }
 }
 
-/// The card, with the CPU running any tile it gets wrong. Handed out only for photos that run on the card.
+/// A remote server's free slot first (when there is one), then the card when this photo runs on it, with the CPU
+/// running any tile either gets wrong. Handed out for photos that run on the card or have a server to share.
 #[cfg(feature = "denoise")]
 impl TileRunner for Network {
     fn run(&self, input: &[f32]) -> Result<Vec<f32>, RunError> {
+        if let Some(Ok(remote)) = self.remote.as_ref().map(|r| r.usable(false))
+            && let Some(Ok(out)) = remote.try_run(input)
+        {
+            return Ok(out);
+        }
+        if !self.local_card.load(Ordering::Relaxed) {
+            return self.cpu.run(input);
+        }
         if let Ok(g) = self.card(false) {
             match g.runner.run(input) {
                 Ok(out) if out.iter().all(|v| v.is_finite()) => return Ok(out),
@@ -361,9 +420,16 @@ impl Model for Network {
     fn runner(&self, run_on: RunOn, threads: usize) -> (&dyn TileRunner, usize) {
         let threads = threads.max(1);
         self.last_threads.store(threads, Ordering::Relaxed);
-        match self.choose(run_on, threads, true) {
-            Ok(_) => (self, threads.min(GPU_PARALLEL)),
-            Err(_) => (&self.cpu, threads),
+        let (card, local) = match self.choose(run_on, threads, true) {
+            Ok(_) => (true, threads.min(GPU_PARALLEL)),
+            Err(_) => (false, threads),
+        };
+        self.local_card.store(card, Ordering::Relaxed);
+        match self.remote.as_ref().map(|r| r.usable(true)) {
+            // the server's slots come on top of this computer's own tiles at once
+            Some(Ok(remote)) => (self, local + remote.slots()),
+            _ if card => (self, local),
+            _ => (&self.cpu, local),
         }
     }
 
@@ -403,6 +469,9 @@ impl Model for Network {
             o.insert("cpuMs".into(), json!(g.cpu_ms));
             o.insert("fellBack".into(), json!(self.fallbacks.load(Ordering::Relaxed)));
         }
+        if let (Some(r), Some(o)) = (&self.remote, v.as_object_mut()) {
+            o.insert("remote".into(), r.describe());
+        }
         v
     }
 }
@@ -412,21 +481,83 @@ pub(crate) fn default_loader() -> Loader {
     #[cfg(feature = "denoise")]
     {
         Arc::new(|path, manifest| {
-            let cpu = lightcraft_denoise::runtime::CpuRunner::load(path, manifest).map_err(|e| e.to_string())?;
-            Ok(Arc::new(Network {
-                cpu,
-                path: path.to_path_buf(),
-                tile: manifest.tile as usize,
-                gpu: OnceLock::new(),
-                fallbacks: AtomicUsize::new(0),
-                last_threads: AtomicUsize::new(0),
-            }) as Arc<dyn Model>)
+            // the server must run this very file: identified by the manifest's hash, else the file's
+            let sha256 = match &manifest.sha256 {
+                Some(h) => Some(h.clone()),
+                None if std::env::var_os("LIGHTCRAFT_DENOISE_URL").is_some() => lightcraft_denoise::hash::sha256_file(path).ok(),
+                None => None,
+            };
+            let remote = sha256.and_then(|h| RemoteSide::from_env(&h, manifest.tile as usize));
+            Ok(Arc::new(network(path, manifest, remote)?) as Arc<dyn Model>)
         })
     }
     #[cfg(not(feature = "denoise"))]
     {
         Arc::new(|_, _| Err("this build cannot run denoise models".to_string()))
     }
+}
+
+/// The model at `path` on this computer, sharing tiles with `remote` when there is one.
+#[cfg(feature = "denoise")]
+fn network(path: &Path, manifest: &DenoiserManifest, remote: Option<RemoteSide>) -> Result<Network, String> {
+    let cpu = lightcraft_denoise::runtime::CpuRunner::load(path, manifest).map_err(|e| e.to_string())?;
+    Ok(Network {
+        remote,
+        local_card: AtomicBool::new(true),
+        cpu,
+        path: path.to_path_buf(),
+        tile: manifest.tile as usize,
+        gpu: OnceLock::new(),
+        fallbacks: AtomicUsize::new(0),
+        last_threads: AtomicUsize::new(0),
+    })
+}
+
+/// A model ready to be served to other computers (`lightcraft-cli denoise-serve`).
+#[cfg(feature = "denoise")]
+pub struct Serving {
+    pub model: lightcraft_denoise::remote::ModelId,
+    pub tile: usize,
+    /// Where its tiles run here: the graphics card's name, or why the CPU does.
+    pub device: String,
+    pub run: lightcraft_denoise::remote::RunTile,
+}
+
+/// The installed model `id` (default: the one selected in Settings) in the models folder `dir` (default: this user's),
+/// set up to run on `run_on` as the app would: the card checked against the CPU first, the CPU when the card can't.
+#[cfg(feature = "denoise")]
+pub fn serving(dir: Option<&Path>, id: Option<&str>, run_on: RunOn) -> Result<Serving, String> {
+    let dir = match dir {
+        Some(d) => d.to_path_buf(),
+        None => crate::config::default_denoise_models_dir().ok_or("no denoise models folder (set LIGHTCRAFT_DENOISE_MODELS)")?,
+    };
+    let want = match id {
+        Some(i) => i.to_string(),
+        None => read_settings(&dir).model.ok_or_else(|| {
+            format!("no denoise model is selected in {} (install one in Settings ▸ AI Denoise, or name it with --model)", dir.display())
+        })?,
+    };
+    let installed = installed_models(&dir)
+        .into_iter()
+        .find(|m| m.manifest.id == want)
+        .ok_or_else(|| format!("no installed denoise model `{want}` in {}", dir.display()))?;
+    let m = &installed.manifest;
+    // the same identity a client derives (see `default_loader`)
+    let sha256 = match &m.sha256 {
+        Some(h) => h.clone(),
+        None => lightcraft_denoise::hash::sha256_file(&installed.onnx).map_err(|e| format!("{}: {e}", installed.onnx.display()))?,
+    };
+    let net = Arc::new(network(&installed.onnx, m, None)?);
+    let tile = m.tile as usize;
+    // set the card up now (and say where the tiles run) rather than with the first client's tile
+    let _ = net.runner(run_on, GPU_PARALLEL);
+    let d = net.device(run_on);
+    let device = match d["kind"].as_str() {
+        Some("gpu") => format!("GPU: {}", d["adapter"].as_str().unwrap_or("?")),
+        _ => format!("CPU ({})", d["reason"].as_str().unwrap_or("chosen")),
+    };
+    let run: lightcraft_denoise::remote::RunTile = Arc::new(move |input: &[f32]| net.runner(run_on, GPU_PARALLEL).0.run(input));
+    Ok(Serving { model: lightcraft_denoise::remote::ModelId { id: m.id.clone(), version: m.version.clone(), sha256 }, tile, device, run })
 }
 
 /// A model that is loaded on first use and kept, shared by the background job and the exports.
@@ -1502,6 +1633,70 @@ mod gpu_tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// A server on this computer running `cpu` for the model with `sha256`.
+    fn server(cpu: lightcraft_denoise::runtime::CpuRunner, sha256: &str, tile: usize) -> String {
+        use lightcraft_denoise::remote::{ModelId, ServerOptions, serve};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let id = ModelId { id: "synthetic".into(), version: "1".into(), sha256: sha256.into() };
+        let run: lightcraft_denoise::remote::RunTile = Arc::new(move |input: &[f32]| cpu.run(input));
+        let opts = ServerOptions { token: "remote-test-token-0123".into(), ..Default::default() };
+        std::thread::spawn(move || serve(l, id, tile, "CPU (test server)".into(), run, opts, Arc::new(|_| {})));
+        addr
+    }
+
+    fn with_remote(path: &Path, tile: u64, addr: &str, sha256: &str) -> Network {
+        let manifest = DenoiserManifest {
+            id: "synthetic".into(),
+            name: "Synthetic".into(),
+            version: "1".into(),
+            licence: Default::default(),
+            source: None,
+            sha256: None,
+            size_bytes: None,
+            provenance: String::new(),
+            domain: Domain::BayerToRgb,
+            tile: tile as u32,
+            overlap: 16,
+            gain: Gain::MatchMean { nominal: 1.0, max_deviation: 0.05 },
+        };
+        let remote = RemoteSide {
+            runner: lightcraft_denoise::remote::Remote::new(addr, "remote-test-token-0123", sha256, tile as usize),
+            greeted: OnceLock::new(),
+        };
+        network(path, &manifest, Some(remote)).unwrap()
+    }
+
+    #[test]
+    fn a_remote_server_shares_the_tiles_and_drops_out_when_it_cannot() {
+        let (_, cpu, path) = model("remote", 64);
+        let sha = lightcraft_denoise::hash::sha256_file(&path).unwrap();
+        let (input, _) = lightcraft_denoise::runtime::test_tile(64);
+        let want = cpu.run(&input).unwrap();
+        // the same model on the server: its slots come on top of this computer's threads, answers within f16 rounding
+        let addr = server(lightcraft_denoise::runtime::CpuRunner::load(&path, &cpu.manifest().clone()).unwrap(), &sha, 64);
+        let net = with_remote(&path, 64, &addr, &sha);
+        let (runner, at_once) = net.runner(RunOn::Cpu, 2);
+        assert_eq!(at_once, 2 + 4, "four server slots on top of two local threads");
+        assert!(worst(&want, &runner.run(&input).unwrap()) < 5e-3);
+        let d = net.device(RunOn::Cpu);
+        assert_eq!(d["remote"]["state"], "used", "{d}");
+        assert_eq!(d["remote"]["device"], "CPU (test server)");
+        // a server running another model is refused: everything runs here
+        let other = server(lightcraft_denoise::runtime::CpuRunner::load(&path, &cpu.manifest().clone()).unwrap(), "0000", 64);
+        let net = with_remote(&path, 64, &other, &sha);
+        let (runner, at_once) = net.runner(RunOn::Cpu, 2);
+        assert_eq!(at_once, 2);
+        assert_eq!(runner.run(&input).unwrap(), want, "the CPU path, bit for bit");
+        let d = net.device(RunOn::Cpu);
+        assert!(d["remote"]["reason"].as_str().is_some_and(|r| r.contains("another model")), "{d}");
+        // nobody listening: the same
+        let net = with_remote(&path, 64, "127.0.0.1:1", &sha);
+        assert_eq!(net.runner(RunOn::Cpu, 3).1, 3);
+        assert_eq!(net.device(RunOn::Cpu)["remote"]["state"], "unavailable");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[test]
     fn with_the_processor_chosen_everything_runs_on_the_cpu() {
         let (model, cpu, path) = model("cpu", 64);
@@ -1548,6 +1743,8 @@ mod gpu_tests {
             gpu: OnceLock::from(Ok(card)),
             fallbacks: AtomicUsize::new(0),
             last_threads: AtomicUsize::new(0),
+            remote: None,
+            local_card: AtomicBool::new(true),
         };
         let (input, _) = lightcraft_denoise::runtime::test_tile(64);
         let want = cpu.run(&input).unwrap();
@@ -1576,6 +1773,8 @@ mod gpu_tests {
             gpu: OnceLock::from(Ok(slow)),
             fallbacks: AtomicUsize::new(0),
             last_threads: AtomicUsize::new(0),
+            remote: None,
+            local_card: AtomicBool::new(true),
         };
         assert_eq!(model.runner(RunOn::Auto, 16).1, 16, "sixteen threads beat it");
         let device = model.device(RunOn::Auto);
